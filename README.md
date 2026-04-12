@@ -1,7 +1,6 @@
 # Cake Backend
 
 ```c
-source -> cake -> c89 -> cakebackend->program
 
 gcc bake.c -o bake
 
