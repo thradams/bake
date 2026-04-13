@@ -1,5 +1,3 @@
-
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,7 +54,7 @@ static void die(const char *fmt, ...) {
 /* Tokens                                                               */
 /* ------------------------------------------------------------------ */
 
-typedef enum {
+enum TokenKind {
     /* literals */
     TK_INT_LIT, TK_FLOAT_LIT, TK_CHAR_LIT, TK_STR_LIT,
     /* identifiers */
@@ -86,16 +84,16 @@ typedef enum {
     TK_ELLIPSIS,
     /* special */
     TK_EOF,
-} TokenKind;
+};
 
-typedef struct {
-    TokenKind kind;
+struct Token {
+    enum TokenKind kind;
     int       line;
     /* value */
     char     *sval;   /* TK_IDENT, TK_STR_LIT */
     long      ival;   /* TK_INT_LIT, TK_CHAR_LIT */
     double    fval;   /* TK_FLOAT_LIT */
-} Token;
+};
 
 /* ------------------------------------------------------------------ */
 /* Lexer                                                                */
@@ -115,14 +113,14 @@ static bool lmatch(char c) {
     return false;
 }
 
-static Token make_tok(TokenKind k) {
-    Token t = {0};
+static struct Token make_tok(enum TokenKind k) {
+    struct Token t = {0};
     t.kind = k;
     t.line = current_line;
     return t;
 }
 
-static struct { const char *word; TokenKind kind; } keywords[] = {
+static struct { const char *word; enum TokenKind kind; } keywords[] = {
     {"auto",     TK_AUTO},     {"break",    TK_BREAK},
     {"char",     TK_CHAR},     {"continue", TK_CONTINUE},
     {"do",       TK_DO},       {"double",   TK_DOUBLE},
@@ -139,7 +137,7 @@ static struct { const char *word; TokenKind kind; } keywords[] = {
 
 /* token buffer -- we lex the whole file up front */
 #define MAX_TOKENS 65536
-static Token tokens[MAX_TOKENS];
+static struct Token tokens[MAX_TOKENS];
 static int   tok_count = 0;
 static int   tok_pos   = 0;
 
@@ -169,7 +167,7 @@ static void lex_all(void) {
 
         if (c == '\0') break;
 
-        Token t = make_tok(TK_EOF);
+        struct Token t = make_tok(TK_EOF);
 
         /* integer / float literals */
         if (isdigit((unsigned char)c)) {
@@ -348,17 +346,17 @@ static void lex_all(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Token stream helpers                                                 */
+/* struct Token stream helpers                                                 */
 /* ------------------------------------------------------------------ */
 
-static Token *peek(void)       { return &tokens[tok_pos]; }
-static Token *peek2(void)      { return &tokens[tok_pos < tok_count-1 ? tok_pos+1 : tok_pos]; }
-static Token *advance(void)    { return &tokens[tok_pos++]; }
-static bool   check(TokenKind k) { return peek()->kind == k; }
-static bool   match(TokenKind k) {
+static struct Token *peek(void)       { return &tokens[tok_pos]; }
+static struct Token *peek2(void)      { return &tokens[tok_pos < tok_count-1 ? tok_pos+1 : tok_pos]; }
+static struct Token *advance(void)    { return &tokens[tok_pos++]; }
+static bool   check(enum TokenKind k) { return peek()->kind == k; }
+static bool   match(enum TokenKind k) {
     if (check(k)) { advance(); return true; } return false;
 }
-static Token *expect(TokenKind k, const char *msg) {
+static struct Token *expect(enum TokenKind k, const char *msg) {
     if (!check(k)) die("%s", msg);
     return advance();
 }
@@ -367,47 +365,45 @@ static Token *expect(TokenKind k, const char *msg) {
 /* Types                                                                */
 /* ------------------------------------------------------------------ */
 
-typedef enum {
+enum TypeKind {
     TY_VOID, TY_CHAR, TY_SHORT, TY_INT, TY_LONG,
     TY_FLOAT, TY_DOUBLE, TY_UNSIGNED,
     TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_FUNC,
-} TypeKind;
+};
 
-typedef struct Type Type;
-typedef struct Member Member;
 
 struct Member {
     char   *name;
-    Type   *type;
+    struct Type   *type;
     int     offset;  /* byte offset within struct/union */
-    Member *next;
+    struct Member *next;
 };
 
 struct Type {
-    TypeKind kind;
-    Type    *base;       /* for PTR, ARRAY */
+    enum TypeKind kind;
+    struct Type    *base;       /* for PTR, ARRAY */
     int      array_size; /* for ARRAY -- literal only */
     /* struct/union */
     char    *tag;
-    Member  *members;
+    struct Member  *members;
     int      size;       /* total size in bytes */
     int      align;
     /* func */
-    Type    *ret;
+    struct Type    *ret;
     /* unsigned modifier */
     bool     is_unsigned;
 };
 
-static Type *ty_void;
-static Type *ty_char;
-static Type *ty_short;
-static Type *ty_int;
-static Type *ty_long;
-static Type *ty_float;
-static Type *ty_double;
+static struct Type *ty_void;
+static struct Type *ty_char;
+static struct Type *ty_short;
+static struct Type *ty_int;
+static struct Type *ty_long;
+static struct Type *ty_float;
+static struct Type *ty_double;
 
-static Type *new_type(TypeKind k) {
-    Type *t = arena_alloc(sizeof(Type));
+static struct Type *new_type(enum TypeKind k) {
+    struct Type *t = arena_alloc(sizeof(struct Type));
     t->kind = k;
     return t;
 }
@@ -422,16 +418,16 @@ static void init_types(void) {
     ty_double = new_type(TY_DOUBLE); ty_double->size= 8;  ty_double->align= 8;
 }
 
-static Type *ptr_to(Type *base) {
-    Type *t = new_type(TY_PTR);
+static struct Type *ptr_to(struct Type *base) {
+    struct Type *t = new_type(TY_PTR);
     t->base  = base;
     t->size  = 8;
     t->align = 8;
     return t;
 }
 
-static Type *array_of(Type *base, int n) {
-    Type *t = new_type(TY_ARRAY);
+static struct Type *array_of(struct Type *base, int n) {
+    struct Type *t = new_type(TY_ARRAY);
     t->base       = base;
     t->array_size = n;
     t->size       = base->size * n;
@@ -439,7 +435,7 @@ static Type *array_of(Type *base, int n) {
     return t;
 }
 
-static int type_size(Type *t) {
+static int type_size(struct Type *t) {
     switch (t->kind) {
         case TY_PTR:   return 8;
         case TY_ARRAY: return t->size;
@@ -453,7 +449,7 @@ static int type_size(Type *t) {
 /* AST nodes                                                            */
 /* ------------------------------------------------------------------ */
 
-typedef enum {
+enum NodeKind {
     /* expressions */
     ND_INT, ND_FLOAT, ND_STR, ND_IDENT,
     ND_UNARY, ND_BINARY, ND_TERNARY,
@@ -477,14 +473,13 @@ typedef enum {
     ND_GVAR,
     ND_STRUCT_DEF,
     ND_PROTO,
-} NodeKind;
+};
 
-typedef struct Node Node;
 
 struct Node {
-    NodeKind kind;
+    enum NodeKind kind;
     int      line;
-    Type    *type;    /* resolved type (filled in symbol resolution) */
+    struct Type    *type;    /* resolved type (filled in symbol resolution) */
 
     /* literals */
     long     ival;
@@ -492,23 +487,23 @@ struct Node {
     char    *sval;
 
     /* general children */
-    Node    *lhs;
-    Node    *rhs;
-    Node    *cond;
-    Node    *then;
-    Node    *els;
-    Node    *body;
-    Node    *init;
-    Node    *step;
+    struct Node    *lhs;
+    struct Node    *rhs;
+    struct Node    *cond;
+    struct Node    *then;
+    struct Node    *els;
+    struct Node    *body;
+    struct Node    *init;
+    struct Node    *step;
 
     /* lists (null-terminated via next) */
-    Node    *next;    /* sibling in a list */
-    Node    *args;    /* call arguments */
-    Node    *params;  /* func parameters */
-    Node    *stmts;   /* block statements */
+    struct Node    *next;    /* sibling in a list */
+    struct Node    *args;    /* call arguments */
+    struct Node    *params;  /* func parameters */
+    struct Node    *stmts;   /* block statements */
 
     /* operator */
-    TokenKind op;
+    enum TokenKind op;
 
     /* name (variable, function, label, member) */
     char    *name;
@@ -518,8 +513,8 @@ struct Node {
     int      offset;  /* stack offset for locals (negative from rbp) */
 };
 
-static Node *new_node(NodeKind k) {
-    Node *n = arena_alloc(sizeof(Node));
+static struct Node *new_node(enum NodeKind k) {
+    struct Node *n = arena_alloc(sizeof(struct Node));
     n->kind = k;
     n->line = current_line;
     return n;
@@ -529,44 +524,40 @@ static Node *new_node(NodeKind k) {
 /* Symbol table                                                         */
 /* ------------------------------------------------------------------ */
 
-typedef struct Sym Sym;
 struct Sym {
     char *name;
-    Type *type;
+    struct Type *type;
     bool  is_local;
     int   offset;    /* local: rbp offset; global: 0 */
-    Sym  *next;
+    struct Sym  *next;
 };
 
-typedef struct Scope Scope;
 struct Scope {
-    Sym   *syms;
-    Scope *parent;
+    struct Sym   *syms;
+    struct Scope *parent;
 };
 
 /* struct/union tag table (flat, global) */
-typedef struct TagEntry TagEntry;
 struct TagEntry {
     char      *tag;
-    Type      *type;
-    TagEntry  *next;
+    struct Type      *type;
+    struct TagEntry  *next;
 };
 
 /* function prototype table */
-typedef struct ProtoEntry ProtoEntry;
 struct ProtoEntry {
     char       *name;
-    Type       *ret_type;
+    struct Type       *ret_type;
     int         arity;    /* -1 = unspecified (empty params) */
-    ProtoEntry *next;
+    struct ProtoEntry *next;
 };
 
-static Scope      *current_scope = NULL;
-static TagEntry   *tag_table     = NULL;
-static ProtoEntry *proto_table   = NULL;
+static struct Scope      *current_scope = NULL;
+static struct TagEntry   *tag_table     = NULL;
+static struct ProtoEntry *proto_table   = NULL;
 
 static void push_scope(void) {
-    Scope *s = arena_alloc(sizeof(Scope));
+    struct Scope *s = arena_alloc(sizeof(struct Scope));
     s->parent = current_scope;
     current_scope = s;
 }
@@ -575,15 +566,15 @@ static void pop_scope(void) {
     current_scope = current_scope->parent;
 }
 
-static Sym *find_sym(const char *name) {
-    for (Scope *s = current_scope; s; s = s->parent)
-        for (Sym *sym = s->syms; sym; sym = sym->next)
+static struct Sym *find_sym(const char *name) {
+    for (struct Scope *s = current_scope; s; s = s->parent)
+        for (struct Sym *sym = s->syms; sym; sym = sym->next)
             if (strcmp(sym->name, name) == 0) return sym;
     return NULL;
 }
 
-static Sym *add_sym(const char *name, Type *type, bool local, int offset) {
-    Sym *sym = arena_alloc(sizeof(Sym));
+static struct Sym *add_sym(const char *name, struct Type *type, bool local, int offset) {
+    struct Sym *sym = arena_alloc(sizeof(struct Sym));
     sym->name     = arena_strdup(name);
     sym->type     = type;
     sym->is_local = local;
@@ -593,28 +584,28 @@ static Sym *add_sym(const char *name, Type *type, bool local, int offset) {
     return sym;
 }
 
-static Type *find_tag(const char *tag) {
-    for (TagEntry *e = tag_table; e; e = e->next)
+static struct Type *find_tag(const char *tag) {
+    for (struct TagEntry *e = tag_table; e; e = e->next)
         if (strcmp(e->tag, tag) == 0) return e->type;
     return NULL;
 }
 
-static void add_tag(const char *tag, Type *type) {
-    TagEntry *e = arena_alloc(sizeof(TagEntry));
+static void add_tag(const char *tag, struct Type *type) {
+    struct TagEntry *e = arena_alloc(sizeof(struct TagEntry));
     e->tag  = arena_strdup(tag);
     e->type = type;
     e->next = tag_table;
     tag_table = e;
 }
 
-static ProtoEntry *find_proto(const char *name) {
-    for (ProtoEntry *e = proto_table; e; e = e->next)
+static struct ProtoEntry *find_proto(const char *name) {
+    for (struct ProtoEntry *e = proto_table; e; e = e->next)
         if (strcmp(e->name, name) == 0) return e;
     return NULL;
 }
 
-static void add_proto(const char *name, Type *ret, int arity) {
-    ProtoEntry *e = arena_alloc(sizeof(ProtoEntry));
+static void add_proto(const char *name, struct Type *ret, int arity) {
+    struct ProtoEntry *e = arena_alloc(sizeof(struct ProtoEntry));
     e->name     = arena_strdup(name);
     e->ret_type = ret;
     e->arity    = arity;
@@ -626,16 +617,16 @@ static void add_proto(const char *name, Type *ret, int arity) {
 /* Parser -- forward declarations                                       */
 /* ------------------------------------------------------------------ */
 
-static Node *parse_expr(void);
-static Node *parse_stmt(void);
-static Type *parse_type_spec(void);
-static Type *parse_declarator(Type *base, char **name_out);
+static struct Node *parse_expr(void);
+static struct Node *parse_stmt(void);
+static struct Type *parse_type_spec(void);
+static struct Type *parse_declarator(struct Type *base, char **name_out);
 
 /* ------------------------------------------------------------------ */
 /* Parser -- types                                                      */
 /* ------------------------------------------------------------------ */
 
-static bool is_type_token(TokenKind k) {
+static bool is_type_token(enum TokenKind k) {
     switch (k) {
         case TK_VOID: case TK_CHAR: case TK_SHORT: case TK_INT:
         case TK_LONG: case TK_FLOAT: case TK_DOUBLE:
@@ -646,29 +637,29 @@ static bool is_type_token(TokenKind k) {
     }
 }
 
-static Type *parse_struct_or_union(bool is_union) {
+static struct Type *parse_struct_or_union(bool is_union) {
     char *tag = NULL;
     if (check(TK_IDENT)) {
         tag = advance()->sval;
         if (!check(TK_LBRACE)) {
             /* reference to existing tag */
-            Type *t = tag ? find_tag(tag) : NULL;
+            struct Type *t = tag ? find_tag(tag) : NULL;
             if (!t) die("unknown struct/union tag '%s'", tag);
             return t;
         }
     }
     expect(TK_LBRACE, "expected '{' in struct/union");
 
-    Type *t = new_type(is_union ? TY_UNION : TY_STRUCT);
+    struct Type *t = new_type(is_union ? TY_UNION : TY_STRUCT);
     t->tag  = tag ? arena_strdup(tag) : NULL;
 
-    Member *head = NULL, *tail = NULL;
+    struct Member *head = NULL, *tail = NULL;
     int offset = 0, max_align = 1;
 
     while (!check(TK_RBRACE)) {
-        Type *base = parse_type_spec();
+        struct Type *base = parse_type_spec();
         char *mname = NULL;
-        Type *mtype = parse_declarator(base, &mname);
+        struct Type *mtype = parse_declarator(base, &mname);
 
         /* reject nested struct/union definitions inline as members */
         if (mtype->kind == TY_STRUCT || mtype->kind == TY_UNION)
@@ -676,7 +667,7 @@ static Type *parse_struct_or_union(bool is_union) {
 
         expect(TK_SEMI, "expected ';' after struct member");
 
-        Member *m = arena_alloc(sizeof(Member));
+        struct Member *m = arena_alloc(sizeof(struct Member));
         m->name = mname ? arena_strdup(mname) : NULL;
         m->type = mtype;
 
@@ -709,7 +700,7 @@ static Type *parse_struct_or_union(bool is_union) {
     return t;
 }
 
-static Type *parse_type_spec(void) {
+static struct Type *parse_type_spec(void) {
     /* skip storage class */
     while (check(TK_AUTO) || check(TK_EXTERN) ||
            check(TK_REGISTER) || check(TK_STATIC))
@@ -718,7 +709,7 @@ static Type *parse_type_spec(void) {
     bool unsign = false;
     if (match(TK_UNSIGNED)) unsign = true;
 
-    Type *base = NULL;
+    struct Type *base = NULL;
     switch (peek()->kind) {
         case TK_VOID:   advance(); base = ty_void;   break;
         case TK_CHAR:   advance(); base = ty_char;   break;
@@ -736,7 +727,7 @@ static Type *parse_type_spec(void) {
 
     if (unsign) {
         /* wrap in unsigned variant */
-        Type *u = new_type(base->kind);
+        struct Type *u = new_type(base->kind);
         *u = *base;
         u->is_unsigned = true;
         base = u;
@@ -745,7 +736,7 @@ static Type *parse_type_spec(void) {
 }
 
 /* parse pointer stars and array brackets wrapping a base type */
-static Type *parse_declarator(Type *base, char **name_out) {
+static struct Type *parse_declarator(struct Type *base, char **name_out) {
     /* pointers */
     int stars = 0;
     while (match(TK_STAR)) stars++;
@@ -756,7 +747,7 @@ static Type *parse_declarator(Type *base, char **name_out) {
     if (name_out) *name_out = name;
 
     /* array brackets -- only literal integer size */
-    Type *t = base;
+    struct Type *t = base;
     for (int i = 0; i < stars; i++) t = ptr_to(t);
 
     /* wrap in void* if base was void and we have stars */
@@ -777,9 +768,9 @@ static Type *parse_declarator(Type *base, char **name_out) {
 /* Parser -- expressions                                                */
 /* ------------------------------------------------------------------ */
 
-static Node *parse_primary(void) {
-    Token *t = peek();
-    Node  *n;
+static struct Node *parse_primary(void) {
+    struct Token *t = peek();
+    struct Node  *n;
 
     if (t->kind == TK_INT_LIT) {
         advance();
@@ -815,7 +806,7 @@ static Node *parse_primary(void) {
         advance();
         /* cast: (type) expr */
         if (is_type_token(peek()->kind)) {
-            Type *cast_type = parse_type_spec();
+            struct Type *cast_type = parse_type_spec();
             char *dummy = NULL;
             cast_type = parse_declarator(cast_type, &dummy);
             expect(TK_RPAREN, "expected ')' after cast type");
@@ -832,36 +823,36 @@ static Node *parse_primary(void) {
     return NULL;
 }
 
-static Node *parse_postfix(void) {
-    Node *n = parse_primary();
+static struct Node *parse_postfix(void) {
+    struct Node *n = parse_primary();
     for (;;) {
         if (match(TK_LBRACKET)) {
-            Node *idx = parse_expr();
+            struct Node *idx = parse_expr();
             expect(TK_RBRACKET, "expected ']'");
-            Node *r = new_node(ND_INDEX);
+            struct Node *r = new_node(ND_INDEX);
             r->lhs = n; r->rhs = idx;
             n = r;
         } else if (match(TK_DOT)) {
-            Token *m = expect(TK_IDENT, "expected member name");
-            Node *r = new_node(ND_MEMBER);
+            struct Token *m = expect(TK_IDENT, "expected member name");
+            struct Node *r = new_node(ND_MEMBER);
             r->lhs  = n;
             r->name = m->sval;
             n = r;
         } else if (match(TK_ARROW)) {
-            Token *m = expect(TK_IDENT, "expected member name");
-            Node *r = new_node(ND_ARROW);
+            struct Token *m = expect(TK_IDENT, "expected member name");
+            struct Node *r = new_node(ND_ARROW);
             r->lhs  = n;
             r->name = m->sval;
             n = r;
         } else if (check(TK_LPAREN)) {
             /* function call */
             advance();
-            Node *call = new_node(ND_CALL);
+            struct Node *call = new_node(ND_CALL);
             call->name = n->name; /* simple ident call */
-            Node *arg_head = NULL, *arg_tail = NULL;
+            struct Node *arg_head = NULL, *arg_tail = NULL;
             int   argc = 0;
             while (!check(TK_RPAREN)) {
-                Node *arg = parse_expr();
+                struct Node *arg = parse_expr();
                 arg->next = NULL;
                 if (!arg_head) arg_head = arg_tail = arg;
                 else { arg_tail->next = arg; arg_tail = arg; }
@@ -873,9 +864,9 @@ static Node *parse_postfix(void) {
             call->ival = argc;
             n = call;
         } else if (match(TK_PLUSPLUS)) {
-            Node *r = new_node(ND_POSTINC); r->lhs = n; n = r;
+            struct Node *r = new_node(ND_POSTINC); r->lhs = n; n = r;
         } else if (match(TK_MINUSMINUS)) {
-            Node *r = new_node(ND_POSTDEC); r->lhs = n; n = r;
+            struct Node *r = new_node(ND_POSTDEC); r->lhs = n; n = r;
         } else {
             break;
         }
@@ -883,34 +874,34 @@ static Node *parse_postfix(void) {
     return n;
 }
 
-static Node *parse_unary(void) {
+static struct Node *parse_unary(void) {
     if (match(TK_PLUSPLUS)) {
-        Node *n = new_node(ND_PREINC); n->lhs = parse_unary(); return n;
+        struct Node *n = new_node(ND_PREINC); n->lhs = parse_unary(); return n;
     }
     if (match(TK_MINUSMINUS)) {
-        Node *n = new_node(ND_PREDEC); n->lhs = parse_unary(); return n;
+        struct Node *n = new_node(ND_PREDEC); n->lhs = parse_unary(); return n;
     }
     if (match(TK_AMP)) {
-        Node *n = new_node(ND_ADDR);  n->lhs = parse_unary(); return n;
+        struct Node *n = new_node(ND_ADDR);  n->lhs = parse_unary(); return n;
     }
     if (match(TK_STAR)) {
-        Node *n = new_node(ND_DEREF); n->lhs = parse_unary(); return n;
+        struct Node *n = new_node(ND_DEREF); n->lhs = parse_unary(); return n;
     }
     if (match(TK_MINUS)) {
-        Node *n = new_node(ND_UNARY); n->op = TK_MINUS; n->lhs = parse_unary(); return n;
+        struct Node *n = new_node(ND_UNARY); n->op = TK_MINUS; n->lhs = parse_unary(); return n;
     }
     if (match(TK_BANG)) {
-        Node *n = new_node(ND_UNARY); n->op = TK_BANG;  n->lhs = parse_unary(); return n;
+        struct Node *n = new_node(ND_UNARY); n->op = TK_BANG;  n->lhs = parse_unary(); return n;
     }
     if (match(TK_TILDE)) {
-        Node *n = new_node(ND_UNARY); n->op = TK_TILDE; n->lhs = parse_unary(); return n;
+        struct Node *n = new_node(ND_UNARY); n->op = TK_TILDE; n->lhs = parse_unary(); return n;
     }
     return parse_postfix();
 }
 
-static Node *parse_binary(int min_prec);
+static struct Node *parse_binary(int min_prec);
 
-static int binary_prec(TokenKind k) {
+static int binary_prec(enum TokenKind k) {
     switch (k) {
         case TK_STAR: case TK_SLASH: case TK_PERCENT: return 12;
         case TK_PLUS: case TK_MINUS:                  return 11;
@@ -926,14 +917,14 @@ static int binary_prec(TokenKind k) {
     }
 }
 
-static Node *parse_binary(int min_prec) {
-    Node *lhs = parse_unary();
+static struct Node *parse_binary(int min_prec) {
+    struct Node *lhs = parse_unary();
     for (;;) {
         int prec = binary_prec(peek()->kind);
         if (prec < min_prec) break;
-        TokenKind op = advance()->kind;
-        Node *rhs = parse_binary(prec + 1);
-        Node *n   = new_node(ND_BINARY);
+        enum TokenKind op = advance()->kind;
+        struct Node *rhs = parse_binary(prec + 1);
+        struct Node *n   = new_node(ND_BINARY);
         n->op  = op;
         n->lhs = lhs;
         n->rhs = rhs;
@@ -942,7 +933,7 @@ static Node *parse_binary(int min_prec) {
     return lhs;
 }
 
-static bool is_assign_op(TokenKind k) {
+static bool is_assign_op(enum TokenKind k) {
     switch (k) {
         case TK_ASSIGN: case TK_PLUS_ASSIGN: case TK_MINUS_ASSIGN:
         case TK_STAR_ASSIGN: case TK_SLASH_ASSIGN: case TK_PERCENT_ASSIGN:
@@ -953,24 +944,24 @@ static bool is_assign_op(TokenKind k) {
     }
 }
 
-static Node *parse_expr(void) {
-    Node *lhs = parse_binary(3);
+static struct Node *parse_expr(void) {
+    struct Node *lhs = parse_binary(3);
 
     /* ternary */
     if (match(TK_QUESTION)) {
-        Node *then = parse_expr();
+        struct Node *then = parse_expr();
         expect(TK_COLON, "expected ':' in ternary");
-        Node *els = parse_expr();
-        Node *n   = new_node(ND_TERNARY);
+        struct Node *els = parse_expr();
+        struct Node *n   = new_node(ND_TERNARY);
         n->cond = lhs; n->then = then; n->els = els;
         return n;
     }
 
     /* assignment */
     if (is_assign_op(peek()->kind)) {
-        TokenKind op = advance()->kind;
-        Node *rhs    = parse_expr();
-        Node *n      = new_node(ND_ASSIGN);
+        enum TokenKind op = advance()->kind;
+        struct Node *rhs    = parse_expr();
+        struct Node *n      = new_node(ND_ASSIGN);
         n->op  = op;
         n->lhs = lhs;
         n->rhs = rhs;
@@ -984,16 +975,16 @@ static Node *parse_expr(void) {
 /* Parser -- statements                                                 */
 /* ------------------------------------------------------------------ */
 
-static Node *parse_block(void);
+static struct Node *parse_block(void);
 
-static Node *parse_stmt(void) {
-    Token *t = peek();
+static struct Node *parse_stmt(void) {
+    struct Token *t = peek();
 
     /* labeled statement */
     if (t->kind == TK_IDENT && peek2()->kind == TK_COLON) {
         char *lname = advance()->sval;
         advance(); /* colon */
-        Node *n = new_node(ND_LABEL);
+        struct Node *n = new_node(ND_LABEL);
         n->name = lname;
         n->body = parse_stmt();
         return n;
@@ -1001,55 +992,55 @@ static Node *parse_stmt(void) {
 
     if (match(TK_IF)) {
         expect(TK_LPAREN, "expected '(' after if");
-        Node *cond = parse_expr();
+        struct Node *cond = parse_expr();
         expect(TK_RPAREN, "expected ')' after if condition");
-        Node *then = parse_stmt();
-        Node *els  = NULL;
+        struct Node *then = parse_stmt();
+        struct Node *els  = NULL;
         if (match(TK_ELSE)) els = parse_stmt();
-        Node *n = new_node(ND_IF);
+        struct Node *n = new_node(ND_IF);
         n->cond = cond; n->then = then; n->els = els;
         return n;
     }
 
     if (match(TK_WHILE)) {
         expect(TK_LPAREN, "expected '(' after while");
-        Node *cond = parse_expr();
+        struct Node *cond = parse_expr();
         expect(TK_RPAREN, "expected ')' after while condition");
-        Node *body = parse_stmt();
-        Node *n = new_node(ND_WHILE);
+        struct Node *body = parse_stmt();
+        struct Node *n = new_node(ND_WHILE);
         n->cond = cond; n->body = body;
         return n;
     }
 
     if (match(TK_DO)) {
-        Node *body = parse_stmt();
+        struct Node *body = parse_stmt();
         expect(TK_WHILE, "expected 'while' after do body");
         expect(TK_LPAREN, "expected '('");
-        Node *cond = parse_expr();
+        struct Node *cond = parse_expr();
         expect(TK_RPAREN, "expected ')'");
         expect(TK_SEMI, "expected ';' after do-while");
-        Node *n = new_node(ND_DO_WHILE);
+        struct Node *n = new_node(ND_DO_WHILE);
         n->body = body; n->cond = cond;
         return n;
     }
 
     if (match(TK_FOR)) {
         expect(TK_LPAREN, "expected '(' after for");
-        Node *init = NULL, *cond = NULL, *step = NULL;
+        struct Node *init = NULL, *cond = NULL, *step = NULL;
         if (!check(TK_SEMI)) init = parse_expr();
         expect(TK_SEMI, "expected ';' in for");
         if (!check(TK_SEMI)) cond = parse_expr();
         expect(TK_SEMI, "expected ';' in for");
         if (!check(TK_RPAREN)) step = parse_expr();
         expect(TK_RPAREN, "expected ')' after for");
-        Node *body = parse_stmt();
-        Node *n = new_node(ND_FOR);
+        struct Node *body = parse_stmt();
+        struct Node *n = new_node(ND_FOR);
         n->init = init; n->cond = cond; n->step = step; n->body = body;
         return n;
     }
 
     if (match(TK_RETURN)) {
-        Node *n = new_node(ND_RETURN);
+        struct Node *n = new_node(ND_RETURN);
         if (!check(TK_SEMI)) n->lhs = parse_expr();
         expect(TK_SEMI, "expected ';' after return");
         return n;
@@ -1066,9 +1057,9 @@ static Node *parse_stmt(void) {
     }
 
     if (match(TK_GOTO)) {
-        Token *label = expect(TK_IDENT, "expected label after goto");
+        struct Token *label = expect(TK_IDENT, "expected label after goto");
         expect(TK_SEMI, "expected ';' after goto");
-        Node *n = new_node(ND_GOTO);
+        struct Node *n = new_node(ND_GOTO);
         n->name = label->sval;
         return n;
     }
@@ -1077,9 +1068,9 @@ static Node *parse_stmt(void) {
 
     /* declaration or expression statement */
     if (is_type_token(t->kind)) {
-        Type *base = parse_type_spec();
+        struct Type *base = parse_type_spec();
         char *name = NULL;
-        Type *vtype = parse_declarator(base, &name);
+        struct Type *vtype = parse_declarator(base, &name);
         if (!name) die("expected variable name in declaration");
 
         /* block-scope static is rejected */
@@ -1087,7 +1078,7 @@ static Node *parse_stmt(void) {
            we'd need to thread it through -- simple approach: reject TK_STATIC
            before calling parse_type_spec in block context) */
 
-        Node *n = new_node(ND_DECL);
+        struct Node *n = new_node(ND_DECL);
         n->name = name;
         n->type = vtype;
         if (match(TK_ASSIGN)) n->init = parse_expr();
@@ -1096,18 +1087,18 @@ static Node *parse_stmt(void) {
     }
 
     /* expression statement */
-    Node *n = new_node(ND_EXPR_STMT);
+    struct Node *n = new_node(ND_EXPR_STMT);
     n->lhs = parse_expr();
     expect(TK_SEMI, "expected ';'");
     return n;
 }
 
-static Node *parse_block(void) {
+static struct Node *parse_block(void) {
     expect(TK_LBRACE, "expected '{'");
-    Node *block = new_node(ND_BLOCK);
-    Node *head = NULL, *tail = NULL;
+    struct Node *block = new_node(ND_BLOCK);
+    struct Node *head = NULL, *tail = NULL;
     while (!check(TK_RBRACE) && !check(TK_EOF)) {
-        Node *s = parse_stmt();
+        struct Node *s = parse_stmt();
         s->next = NULL;
         if (!head) head = tail = s;
         else { tail->next = s; tail = s; }
@@ -1121,13 +1112,13 @@ static Node *parse_block(void) {
 /* Parser -- top level                                                  */
 /* ------------------------------------------------------------------ */
 
-static Node *parse_program(void) {
-    Node *head = NULL, *tail = NULL;
+static struct Node *parse_program(void) {
+    struct Node *head = NULL, *tail = NULL;
 
     while (!check(TK_EOF)) {
-        Type *base = parse_type_spec();
+        struct Type *base = parse_type_spec();
         char *name = NULL;
-        Type *dtype = parse_declarator(base, &name);
+        struct Type *dtype = parse_declarator(base, &name);
 
         if (!name) die("expected name at top level");
 
@@ -1135,16 +1126,16 @@ static Node *parse_program(void) {
         if (check(TK_LPAREN) || dtype->kind == TY_FUNC) {
             /* parse parameter list */
             expect(TK_LPAREN, "expected '('");
-            Node *params = NULL, *ptail = NULL;
+            struct Node *params = NULL, *ptail = NULL;
             int   arity  = 0;
 
             if (!check(TK_RPAREN)) {
                 do {
                     if (check(TK_RPAREN)) break;
-                    Type *pbase  = parse_type_spec();
+                    struct Type *pbase  = parse_type_spec();
                     char *pname  = NULL;
-                    Type *ptype  = parse_declarator(pbase, &pname);
-                    Node *param  = new_node(ND_DECL);
+                    struct Type *ptype  = parse_declarator(pbase, &pname);
+                    struct Node *param  = new_node(ND_DECL);
                     param->type  = ptype;
                     param->name  = pname;
                     param->next  = NULL;
@@ -1163,7 +1154,7 @@ static Node *parse_program(void) {
 
             /* function definition */
             add_proto(name, base, arity);
-            Node *fn = new_node(ND_FUNC);
+            struct Node *fn = new_node(ND_FUNC);
             fn->name   = name;
             fn->type   = base;
             fn->params = params;
@@ -1175,7 +1166,7 @@ static Node *parse_program(void) {
 
         } else {
             /* global variable */
-            Node *gv = new_node(ND_GVAR);
+            struct Node *gv = new_node(ND_GVAR);
             gv->name = name;
             gv->type = dtype;
             if (match(TK_ASSIGN)) gv->init = parse_expr();
@@ -1194,17 +1185,17 @@ static Node *parse_program(void) {
 
 static int local_offset; /* tracks current frame size during resolution */
 
-static void resolve_expr(Node *n);
-static void resolve_stmt(Node *n);
+static void resolve_expr(struct Node *n);
+static void resolve_stmt(struct Node *n);
 
-static void resolve_expr(Node *n) {
+static void resolve_expr(struct Node *n) {
     if (!n) return;
     switch (n->kind) {
         case ND_IDENT: {
-            Sym *sym = find_sym(n->name);
+            struct Sym *sym = find_sym(n->name);
             if (!sym) {
                 /* check proto table for functions */
-                ProtoEntry *pe = find_proto(n->name);
+                struct ProtoEntry *pe = find_proto(n->name);
                 if (!pe) die("undeclared identifier '%s'", n->name);
             } else {
                 n->is_local = sym->is_local;
@@ -1234,10 +1225,10 @@ static void resolve_expr(Node *n) {
             resolve_expr(n->els);
             break;
         case ND_CALL: {
-            ProtoEntry *pe = find_proto(n->name);
+            struct ProtoEntry *pe = find_proto(n->name);
             if (!pe) die("call to undeclared function '%s'", n->name);
             n->type = pe->ret_type;
-            for (Node *a = n->args; a; a = a->next) resolve_expr(a);
+            for (struct Node *a = n->args; a; a = a->next) resolve_expr(a);
             break;
         }
         case ND_INDEX:
@@ -1255,12 +1246,12 @@ static void resolve_expr(Node *n) {
     }
 }
 
-static void resolve_stmt(Node *n) {
+static void resolve_stmt(struct Node *n) {
     if (!n) return;
     switch (n->kind) {
         case ND_BLOCK:
             push_scope();
-            for (Node *s = n->stmts; s; s = s->next) resolve_stmt(s);
+            for (struct Node *s = n->stmts; s; s = s->next) resolve_stmt(s);
             pop_scope();
             break;
         case ND_DECL: {
@@ -1300,13 +1291,13 @@ static void resolve_stmt(Node *n) {
     }
 }
 
-static void resolve_func(Node *fn) {
+static void resolve_func(struct Node *fn) {
     push_scope();
     local_offset = 0;
 
     /* add parameters to scope */
     int arg_regs_used = 0;
-    for (Node *p = fn->params; p; p = p->next) {
+    for (struct Node *p = fn->params; p; p = p->next) {
         int sz = type_size(p->type);
         int al = p->type->align ? p->type->align : 8;
         local_offset = (local_offset + sz + al - 1) & ~(al - 1);
@@ -1380,20 +1371,20 @@ static const char *size_suffix(int bytes) {
 }
 
 /* load an lvalue address into rax */
-static void gen_addr(Node *n);
+static void gen_addr(struct Node *n);
 /* evaluate expression, result in rax (or xmm0 for float) */
-static void gen_expr(Node *n);
-static void gen_stmt(Node *n);
+static void gen_expr(struct Node *n);
+static void gen_stmt(struct Node *n);
 
 /* find struct member */
-static Member *find_member(Type *t, const char *name) {
-    for (Member *m = t->members; m; m = m->next)
+static struct Member *find_member(struct Type *t, const char *name) {
+    for (struct Member *m = t->members; m; m = m->next)
         if (m->name && strcmp(m->name, name) == 0) return m;
     die("no member '%s' in struct/union", name);
     return NULL;
 }
 
-static void gen_addr(Node *n) {
+static void gen_addr(struct Node *n) {
     switch (n->kind) {
         case ND_IDENT:
             if (n->is_local)
@@ -1421,18 +1412,18 @@ static void gen_addr(Node *n) {
             /* type of lhs must be struct */
             /* we rely on the type being set during resolution */
             /* find member offset from the struct type */
-            Type *st = n->lhs->type;
+            struct Type *st = n->lhs->type;
             if (!st) die("unresolved struct type for member access");
-            Member *m = find_member(st, n->name);
+            struct Member *m = find_member(st, n->name);
             emit("  addq $%d, %%rax", m->offset);
             break;
         }
         case ND_ARROW: {
             gen_expr(n->lhs);  /* pointer value in rax */
-            Type *st = n->lhs->type;
+            struct Type *st = n->lhs->type;
             if (st && st->kind == TY_PTR) st = st->base;
             if (!st) die("unresolved struct type for arrow access");
-            Member *m = find_member(st, n->name);
+            struct Member *m = find_member(st, n->name);
             emit("  addq $%d, %%rax", m->offset);
             break;
         }
@@ -1441,7 +1432,7 @@ static void gen_addr(Node *n) {
     }
 }
 
-static void gen_expr(Node *n) {
+static void gen_expr(struct Node *n) {
     switch (n->kind) {
         case ND_INT:
             emit("  movq $%ld, %%rax", n->ival);
@@ -1635,8 +1626,8 @@ static void gen_expr(Node *n) {
         case ND_CALL: {
             /* push args right to left */
             int argc = 0;
-            Node *args[16];
-            for (Node *a = n->args; a; a = a->next) args[argc++] = a;
+            struct Node *args[16];
+            for (struct Node *a = n->args; a; a = a->next) args[argc++] = a;
             /* evaluate args and put in registers */
             for (int i = argc - 1; i >= 0; i--) {
                 gen_expr(args[i]);
@@ -1699,11 +1690,11 @@ static void gen_expr(Node *n) {
     }
 }
 
-static void gen_stmt(Node *n) {
+static void gen_stmt(struct Node *n) {
     if (!n) return;
     switch (n->kind) {
         case ND_BLOCK:
-            for (Node *s = n->stmts; s; s = s->next) gen_stmt(s);
+            for (struct Node *s = n->stmts; s; s = s->next) gen_stmt(s);
             return;
         case ND_EXPR_STMT:
             gen_expr(n->lhs);
@@ -1814,7 +1805,7 @@ static void gen_stmt(Node *n) {
     }
 }
 
-static void gen_func(Node *fn) {
+static void gen_func(struct Node *fn) {
     char end_label[64];
     sprintf(end_label, ".Lret_%s", fn->name);
     current_func_end = arena_strdup(end_label);
@@ -1832,7 +1823,7 @@ static void gen_func(Node *fn) {
 
     /* move register args to stack slots */
     int i = 0;
-    for (Node *p = fn->params; p; p = p->next, i++) {
+    for (struct Node *p = fn->params; p; p = p->next, i++) {
         if (i < 6)
             emit("  movq %%%s, %d(%%rbp)", arg_regs[i], p->offset);
     }
@@ -1846,7 +1837,7 @@ static void gen_func(Node *fn) {
     emit("  ret");
 }
 
-static void gen_gvar(Node *gv) {
+static void gen_gvar(struct Node *gv) {
     if (gv->init) {
         emit("  .data");
         emit("  .globl %s", gv->name);
@@ -1906,13 +1897,13 @@ int main(int argc, char **argv) {
     out     = stdout;
 
     lex_all();
-    Node *program = parse_program();
+    struct Node *program = parse_program();
 
     /* emit GNU-stack note to mark stack non-executable */
     emit("  .section .note.GNU-stack,\"\",@progbits");
 
     /* resolve and generate */
-    for (Node *n = program; n; n = n->next) {
+    for (struct Node *n = program; n; n = n->next) {
         if (n->kind == ND_FUNC) {
             resolve_func(n);
             gen_func(n);
