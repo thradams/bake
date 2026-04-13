@@ -1213,10 +1213,22 @@ static void resolve_expr(struct Node *n) {
         }
         case ND_INT: case ND_FLOAT: case ND_STR:
             break;
-        case ND_UNARY: case ND_ADDR: case ND_DEREF:
-        case ND_PREINC: case ND_PREDEC:
+        case ND_UNARY: case ND_PREINC: case ND_PREDEC:
         case ND_POSTINC: case ND_POSTDEC:
             resolve_expr(n->lhs);
+            n->type = n->lhs->type;
+            break;
+        case ND_ADDR:
+            resolve_expr(n->lhs);
+            /* type is pointer to lhs type -- simplified, reuse lhs type */
+            n->type = n->lhs->type;
+            break;
+        case ND_DEREF:
+            resolve_expr(n->lhs);
+            if (n->lhs->type && (n->lhs->type->kind == TY_PTR || n->lhs->type->kind == TY_ARRAY))
+                n->type = n->lhs->type->base;
+            else
+                n->type = n->lhs->type;
             break;
         case ND_BINARY:
             resolve_expr(n->lhs);
@@ -1225,6 +1237,7 @@ static void resolve_expr(struct Node *n) {
         case ND_ASSIGN:
             resolve_expr(n->lhs);
             resolve_expr(n->rhs);
+            n->type = n->lhs->type;
             break;
         case ND_TERNARY:
             resolve_expr(n->cond);
@@ -1245,6 +1258,13 @@ static void resolve_expr(struct Node *n) {
         case ND_INDEX:
             resolve_expr(n->lhs);
             resolve_expr(n->rhs);
+            /* element type: base of array or pointer */
+            if (n->lhs->type) {
+                if (n->lhs->type->kind == TY_ARRAY || n->lhs->type->kind == TY_PTR)
+                    n->type = n->lhs->type->base;
+                else
+                    n->type = n->lhs->type;
+            }
             break;
         case ND_MEMBER: case ND_ARROW:
             resolve_expr(n->lhs);
@@ -1354,10 +1374,16 @@ static char *continue_label;
 
 /* System V AMD64: integer args in rdi, rsi, rdx, rcx, r8, r9 */
 static const char *arg_regs[] = {
-    "rdi", "rsi", "rdx", "rcx", "r8", "r9"
+    "rdi", "rsi", "rdx", "rcx", "r8",  "r9"
 };
 static const char *arg_regs32[] = {
     "edi", "esi", "edx", "ecx", "r8d", "r9d"
+};
+static const char *arg_regs16[] = {
+    "di",  "si",  "dx",  "cx",  "r8w", "r9w"
+};
+static const char *arg_regs8[] = {
+    "dil", "sil", "dl",  "cl",  "r8b", "r9b"
 };
 
 static int new_label(void) { return label_count++; }
@@ -1411,9 +1437,15 @@ static void gen_addr(struct Node *n) {
             gen_addr(n->lhs);
             emit("  pushq %%rax");
             gen_expr(n->rhs);
-            /* determine element size from lhs type */
-            /* simplified: assume 8 bytes; proper impl needs type info */
-            emit("  imulq $8, %%rax");
+            /* element size from lhs type */
+            int esz = 8;
+            if (n->lhs->type) {
+                struct Type *et = (n->lhs->type->kind == TY_ARRAY || n->lhs->type->kind == TY_PTR)
+                                  ? n->lhs->type->base : n->lhs->type;
+                if (et) esz = type_size(et);
+            }
+            if (esz != 1)
+                emit("  imulq $%d, %%rax", esz);
             emit("  popq %%rcx");
             emit("  addq %%rcx, %%rax");
             break;
@@ -1484,6 +1516,16 @@ static void gen_expr(struct Node *n) {
                     emit("  movswq (%%rax), %%rax");
                 else
                     emit("  movsbq (%%rax), %%rax");
+            }
+            return;
+        case ND_INDEX:
+            gen_addr(n);
+            {
+                int sz = n->type ? type_size(n->type) : 8;
+                if (sz == 8)       emit("  movq (%%rax), %%rax");
+                else if (sz == 4)  emit("  movslq (%%rax), %%rax");
+                else if (sz == 2)  emit("  movswq (%%rax), %%rax");
+                else               emit("  movsbq (%%rax), %%rax");
             }
             return;
         case ND_ADDR:
@@ -1594,9 +1636,13 @@ static void gen_expr(struct Node *n) {
             gen_addr(n->lhs);
             emit("  popq %%rcx");
             if (n->op != TK_ASSIGN) {
-                /* compound: load current value */
+                /* compound: load current lhs value */
+                int sz = n->lhs->type ? type_size(n->lhs->type) : 8;
                 emit("  pushq %%rax");  /* save addr */
-                emit("  movq (%%rax), %%rax");
+                if      (sz == 8) emit("  movq (%%rax), %%rax");
+                else if (sz == 4) emit("  movslq (%%rax), %%rax");
+                else if (sz == 2) emit("  movswq (%%rax), %%rax");
+                else              emit("  movsbq (%%rax), %%rax");
                 emit("  pushq %%rax");  /* save lhs val */
                 emit("  movq %%rcx, %%rax"); /* rhs -> rax */
                 emit("  popq %%rcx");   /* lhs -> rcx */
@@ -1618,7 +1664,14 @@ static void gen_expr(struct Node *n) {
                 emit("  movq %%rax, %%rcx");  /* result -> rcx */
                 emit("  popq %%rax");          /* addr */
             }
-            emit("  movq %%rcx, (%%rax)");
+            /* size-aware store based on lhs type */
+            {
+                int sz = n->lhs->type ? type_size(n->lhs->type) : 8;
+                if (sz == 8)      emit("  movq %%rcx, (%%rax)");
+                else if (sz == 4) emit("  movl %%ecx, (%%rax)");
+                else if (sz == 2) emit("  movw %%cx,  (%%rax)");
+                else              emit("  movb %%cl,  (%%rax)");
+            }
             emit("  movq %%rcx, %%rax");
             return;
         }
@@ -1682,51 +1735,49 @@ static void gen_expr(struct Node *n) {
             if (cleanup) emit("  addq $%d, %%rsp", cleanup);
             return;
         }
-        case ND_INDEX:
-            gen_addr(n);
-            emit("  movq (%%rax), %%rax");
-            return;
         case ND_MEMBER:
-            gen_addr(n);
-            emit("  movq (%%rax), %%rax");
-            return;
         case ND_ARROW:
             gen_addr(n);
-            emit("  movq (%%rax), %%rax");
+            {
+                int sz = n->type ? type_size(n->type) : 8;
+                if (sz == 8)      emit("  movq (%%rax), %%rax");
+                else if (sz == 4) emit("  movslq (%%rax), %%rax");
+                else if (sz == 2) emit("  movswq (%%rax), %%rax");
+                else              emit("  movsbq (%%rax), %%rax");
+            }
             return;
         case ND_CAST:
             gen_expr(n->lhs);
             return;
-        case ND_PREINC:
+        case ND_PREINC: case ND_PREDEC:
+        case ND_POSTINC: case ND_POSTDEC: {
             gen_addr(n->lhs);
-            emit("  movq (%%rax), %%rcx");
-            emit("  incq %%rcx");
-            emit("  movq %%rcx, (%%rax)");
-            emit("  movq %%rcx, %%rax");
+            int sz = n->type ? type_size(n->type) : 8;
+            /* load */
+            if      (sz == 8) emit("  movq (%%rax), %%rcx");
+            else if (sz == 4) emit("  movslq (%%rax), %%rcx");
+            else if (sz == 2) emit("  movswq (%%rax), %%rcx");
+            else              emit("  movsbq (%%rax), %%rcx");
+            if (n->kind == ND_POSTINC || n->kind == ND_POSTDEC) {
+                emit("  movq %%rcx, %%rdx");
+                if (n->kind == ND_POSTINC) emit("  incq %%rdx");
+                else                       emit("  decq %%rdx");
+                if      (sz == 8) emit("  movq  %%rdx, (%%rax)");
+                else if (sz == 4) emit("  movl  %%edx, (%%rax)");
+                else if (sz == 2) emit("  movw  %%dx,  (%%rax)");
+                else              emit("  movb  %%dl,  (%%rax)");
+                emit("  movq %%rcx, %%rax");
+            } else {
+                if (n->kind == ND_PREINC) emit("  incq %%rcx");
+                else                      emit("  decq %%rcx");
+                if      (sz == 8) emit("  movq  %%rcx, (%%rax)");
+                else if (sz == 4) emit("  movl  %%ecx, (%%rax)");
+                else if (sz == 2) emit("  movw  %%cx,  (%%rax)");
+                else              emit("  movb  %%cl,  (%%rax)");
+                emit("  movq %%rcx, %%rax");
+            }
             return;
-        case ND_PREDEC:
-            gen_addr(n->lhs);
-            emit("  movq (%%rax), %%rcx");
-            emit("  decq %%rcx");
-            emit("  movq %%rcx, (%%rax)");
-            emit("  movq %%rcx, %%rax");
-            return;
-        case ND_POSTINC:
-            gen_addr(n->lhs);
-            emit("  movq (%%rax), %%rcx");
-            emit("  movq %%rcx, %%rdx");
-            emit("  incq %%rdx");
-            emit("  movq %%rdx, (%%rax)");
-            emit("  movq %%rcx, %%rax");
-            return;
-        case ND_POSTDEC:
-            gen_addr(n->lhs);
-            emit("  movq (%%rax), %%rcx");
-            emit("  movq %%rcx, %%rdx");
-            emit("  decq %%rdx");
-            emit("  movq %%rdx, (%%rax)");
-            emit("  movq %%rcx, %%rax");
-            return;
+        }
         default:
             die("unhandled expression kind %d", n->kind);
     }
@@ -1744,7 +1795,11 @@ static void gen_stmt(struct Node *n) {
         case ND_DECL:
             if (n->init) {
                 gen_expr(n->init);
-                emit("  movq %%rax, %d(%%rbp)", n->offset);
+                int sz = n->type ? type_size(n->type) : 8;
+                if      (sz == 8) emit("  movq  %%rax, %d(%%rbp)", n->offset);
+                else if (sz == 4) emit("  movl  %%eax, %d(%%rbp)", n->offset);
+                else if (sz == 2) emit("  movw  %%ax,  %d(%%rbp)", n->offset);
+                else              emit("  movb  %%al,  %d(%%rbp)", n->offset);
             }
             return;
         case ND_RETURN:
@@ -1866,8 +1921,16 @@ static void gen_func(struct Node *fn) {
     /* move register args to stack slots */
     int i = 0;
     for (struct Node *p = fn->params; p; p = p->next, i++) {
-        if (i < 6)
-            emit("  movq %%%s, %d(%%rbp)", arg_regs[i], p->offset);
+        if (i >= 6) break;
+        int sz = p->type ? type_size(p->type) : 8;
+        if (sz == 8)
+            emit("  movq  %%%s, %d(%%rbp)", arg_regs[i],   p->offset);
+        else if (sz == 4)
+            emit("  movl  %%%s, %d(%%rbp)", arg_regs32[i], p->offset);
+        else if (sz == 2)
+            emit("  movw  %%%s, %d(%%rbp)", arg_regs16[i], p->offset);
+        else
+            emit("  movb  %%%s, %d(%%rbp)", arg_regs8[i],  p->offset);
     }
 
     gen_stmt(fn->body);
