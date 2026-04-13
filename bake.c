@@ -172,6 +172,34 @@ static void lex_all(void) {
         /* integer / float literals */
         if (isdigit((unsigned char)c)) {
             long ival = 0;
+            /* hex: c=='0', next is 'x'/'X' */
+            if (c == '0' && (src[src_pos+1] == 'x' || src[src_pos+1] == 'X')) {
+                lnext(); lnext(); /* consume '0' and 'x' */
+                while (isxdigit((unsigned char)lpeek())) {
+                    char h = lnext();
+                    ival = ival * 16 + (isdigit((unsigned char)h)
+                           ? h - '0' : tolower((unsigned char)h) - 'a' + 10);
+                }
+                while (lpeek()=='l'||lpeek()=='L'||lpeek()=='u'||lpeek()=='U') lnext();
+                t.kind = TK_INT_LIT; t.ival = ival;
+                if (tok_count >= MAX_TOKENS) die("too many tokens");
+                tokens[tok_count++] = t;
+                continue;
+            }
+            /* octal: c=='0', next is a digit */
+            if (c == '0' && isdigit((unsigned char)src[src_pos+1])) {
+                lnext(); /* consume '0' */
+                while (isdigit((unsigned char)lpeek()))
+                    ival = ival * 8 + (lnext() - '0');
+                while (lpeek()=='l'||lpeek()=='L'||lpeek()=='u'||lpeek()=='U') lnext();
+                t.kind = TK_INT_LIT; t.ival = ival;
+                if (tok_count >= MAX_TOKENS) die("too many tokens");
+                tokens[tok_count++] = t;
+                continue;
+            }
+            /* decimal / float: consume c then keep reading */
+            lnext();
+            ival = c - '0';
             while (isdigit((unsigned char)lpeek()))
                 ival = ival * 10 + (lnext() - '0');
             if (lpeek() == '.' || lpeek() == 'e' || lpeek() == 'E') {
@@ -645,9 +673,14 @@ static struct Type *parse_struct_or_union(bool is_union) {
     if (check(TK_IDENT)) {
         tag = advance()->sval;
         if (!check(TK_LBRACE)) {
-            /* reference to existing tag */
+            /* reference to existing tag — or forward reference */
             struct Type *t = tag ? find_tag(tag) : NULL;
-            if (!t) die("unknown struct/union tag '%s'", tag);
+            if (!t) {
+                /* forward-declared incomplete type — create a placeholder */
+                t = new_type(is_union ? TY_UNION : TY_STRUCT);
+                t->tag = arena_strdup(tag);
+                add_tag(tag, t);
+            }
             return t;
         }
     }
@@ -655,6 +688,9 @@ static struct Type *parse_struct_or_union(bool is_union) {
 
     struct Type *t = new_type(is_union ? TY_UNION : TY_STRUCT);
     t->tag  = tag ? arena_strdup(tag) : NULL;
+
+    /* register tag before parsing members to allow self-reference */
+    if (tag) add_tag(tag, t);
 
     struct Member *head = NULL, *tail = NULL;
     int offset = 0, max_align = 1;
@@ -664,8 +700,9 @@ static struct Type *parse_struct_or_union(bool is_union) {
         char *mname = NULL;
         struct Type *mtype = parse_declarator(base, &mname);
 
-        /* reject nested struct/union definitions inline as members */
-        if (mtype->kind == TY_STRUCT || mtype->kind == TY_UNION)
+        /* reject nested struct/union definitions inline as members
+           but allow pointer-to-struct */
+        if ((mtype->kind == TY_STRUCT || mtype->kind == TY_UNION) && mname == NULL)
             die("nested struct/union definitions not allowed");
 
         expect(TK_SEMI, "expected ';' after struct member");
@@ -699,7 +736,7 @@ static struct Type *parse_struct_or_union(bool is_union) {
     t->size  = (offset + max_align - 1) & ~(max_align - 1);
     t->align = max_align;
 
-    if (tag) add_tag(tag, t);
+    /* tag already registered above; if a placeholder existed, it's now filled */
     return t;
 }
 
@@ -756,12 +793,27 @@ static struct Type *parse_declarator(struct Type *base, char **name_out) {
     /* wrap in void* if base was void and we have stars */
     /* (handled above naturally) */
 
+    /* array brackets — support multiple dimensions */
     if (match(TK_LBRACKET)) {
-        if (!check(TK_INT_LIT))
-            die("array size must be a literal integer");
-        int sz = (int)advance()->ival;
-        expect(TK_RBRACKET, "expected ']'");
-        t = array_of(t, sz);
+        if (check(TK_RBRACKET)) {
+            /* int a[] in parameter -- decay to pointer */
+            advance();
+            t = ptr_to(t);
+        } else {
+            if (!check(TK_INT_LIT))
+                die("array size must be a literal integer");
+            int sz = (int)advance()->ival;
+            expect(TK_RBRACKET, "expected ']'");
+            /* parse additional dimensions right-to-left so inner dim is base */
+            while (match(TK_LBRACKET)) {
+                if (!check(TK_INT_LIT))
+                    die("array size must be a literal integer");
+                int inner = (int)advance()->ival;
+                expect(TK_RBRACKET, "expected ']'");
+                t = array_of(t, inner);
+            }
+            t = array_of(t, sz);
+        }
     }
 
     return t;
@@ -1123,7 +1175,11 @@ static struct Node *parse_program(void) {
         char *name = NULL;
         struct Type *dtype = parse_declarator(base, &name);
 
-        if (!name) die("expected name at top level");
+        if (!name) {
+            /* could be a standalone struct/union definition: struct Foo { ... }; */
+            if (check(TK_SEMI)) { advance(); continue; }
+            die("expected name at top level");
+        }
 
         /* prototype or function definition */
         if (check(TK_LPAREN) || dtype->kind == TY_FUNC) {
@@ -1233,6 +1289,12 @@ static void resolve_expr(struct Node *n) {
         case ND_BINARY:
             resolve_expr(n->lhs);
             resolve_expr(n->rhs);
+            /* result type: if ptr+int or ptr-int, keep pointer type */
+            if (n->lhs->type && (n->lhs->type->kind == TY_PTR || n->lhs->type->kind == TY_ARRAY)
+                && (n->op == TK_PLUS || n->op == TK_MINUS))
+                n->type = n->lhs->type;
+            else
+                n->type = n->lhs->type;  /* default: lhs type */
             break;
         case ND_ASSIGN:
             resolve_expr(n->lhs);
@@ -1434,14 +1496,20 @@ static void gen_addr(struct Node *n) {
             break;
         case ND_INDEX: {
             /* addr = base + index * elem_size */
-            gen_addr(n->lhs);
+            /* if lhs is a pointer (not array), load its value; if array, take its address */
+            struct Type *lhs_type = n->lhs->type;
+            if (lhs_type && lhs_type->kind == TY_PTR) {
+                gen_expr(n->lhs);  /* load pointer value into rax */
+            } else {
+                gen_addr(n->lhs);  /* address of array base */
+            }
             emit("  pushq %%rax");
             gen_expr(n->rhs);
-            /* element size from lhs type */
+            /* element size */
             int esz = 8;
-            if (n->lhs->type) {
-                struct Type *et = (n->lhs->type->kind == TY_ARRAY || n->lhs->type->kind == TY_PTR)
-                                  ? n->lhs->type->base : n->lhs->type;
+            if (lhs_type) {
+                struct Type *et = (lhs_type->kind == TY_ARRAY || lhs_type->kind == TY_PTR)
+                                  ? lhs_type->base : lhs_type;
                 if (et) esz = type_size(et);
             }
             if (esz != 1)
@@ -1505,7 +1573,11 @@ static void gen_expr(struct Node *n) {
         }
         case ND_IDENT:
             gen_addr(n);
-            /* load value */
+            /* arrays decay to pointer (their address); scalars get loaded */
+            if (n->type && n->type->kind == TY_ARRAY) {
+                /* rax already holds the address — that is the value */
+                return;
+            }
             {
                 int sz = n->type ? type_size(n->type) : 8;
                 if (sz == 8)
@@ -1533,7 +1605,13 @@ static void gen_expr(struct Node *n) {
             return;
         case ND_DEREF:
             gen_expr(n->lhs);
-            emit("  movq (%%rax), %%rax");
+            {
+                int sz = n->type ? type_size(n->type) : 8;
+                if (sz == 8)      emit("  movq (%%rax), %%rax");
+                else if (sz == 4) emit("  movslq (%%rax), %%rax");
+                else if (sz == 2) emit("  movswq (%%rax), %%rax");
+                else              emit("  movsbq (%%rax), %%rax");
+            }
             return;
         case ND_UNARY:
             gen_expr(n->lhs);
@@ -1548,8 +1626,23 @@ static void gen_expr(struct Node *n) {
                 default: break;
             }
             return;
-        case ND_BINARY:
+        case ND_BINARY: {
+            /* detect pointer arithmetic: ptr +/- int needs scaling */
+            bool lhs_is_ptr = n->lhs->type &&
+                              (n->lhs->type->kind == TY_PTR ||
+                               n->lhs->type->kind == TY_ARRAY);
+            bool rhs_is_ptr = n->rhs->type &&
+                              (n->rhs->type->kind == TY_PTR ||
+                               n->rhs->type->kind == TY_ARRAY);
+            int ptr_scale = 1;
+            if ((n->op == TK_PLUS || n->op == TK_MINUS) && lhs_is_ptr && !rhs_is_ptr) {
+                struct Type *base = n->lhs->type->kind == TY_PTR
+                                    ? n->lhs->type->base : n->lhs->type->base;
+                if (base) ptr_scale = type_size(base);
+            }
+
             gen_expr(n->rhs);
+            if (ptr_scale > 1) emit("  imulq $%d, %%rax", ptr_scale);
             emit("  pushq %%rax");
             gen_expr(n->lhs);
             emit("  popq %%rcx");
@@ -1630,6 +1723,7 @@ static void gen_expr(struct Node *n) {
                 default: break;
             }
             return;
+        }
         case ND_ASSIGN: {
             gen_expr(n->rhs);
             emit("  pushq %%rax");
@@ -2008,6 +2102,12 @@ int main(int argc, char **argv) {
     emit("  .section .note.GNU-stack,\"\",@progbits");
 
     /* resolve and generate */
+    /* first pass: register all globals in the symbol table */
+    for (struct Node *n = program; n; n = n->next) {
+        if (n->kind == ND_GVAR)
+            add_sym(n->name, n->type, false, 0);
+    }
+    /* second pass: resolve and emit */
     for (struct Node *n = program; n; n = n->next) {
         if (n->kind == ND_FUNC) {
             resolve_func(n);
