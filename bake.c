@@ -510,6 +510,7 @@ struct Node {
 
     /* declaration */
     bool     is_local;
+    bool     is_variadic; /* for ND_FUNC: has ... parameter */
     int      offset;  /* stack offset for locals (negative from rbp) */
 };
 
@@ -548,7 +549,8 @@ struct TagEntry {
 struct ProtoEntry {
     char       *name;
     struct Type       *ret_type;
-    int         arity;    /* -1 = unspecified (empty params) */
+    int         arity;       /* -1 = unspecified (empty params) */
+    bool        is_variadic; /* true if declared with ... */
     struct ProtoEntry *next;
 };
 
@@ -604,13 +606,14 @@ static struct ProtoEntry *find_proto(const char *name) {
     return NULL;
 }
 
-static void add_proto(const char *name, struct Type *ret, int arity) {
+static void add_proto(const char *name, struct Type *ret, int arity, bool variadic) {
     struct ProtoEntry *e = arena_alloc(sizeof(struct ProtoEntry));
-    e->name     = arena_strdup(name);
-    e->ret_type = ret;
-    e->arity    = arity;
-    e->next     = proto_table;
-    proto_table = e;
+    e->name        = arena_strdup(name);
+    e->ret_type    = ret;
+    e->arity       = arity;
+    e->is_variadic = variadic;
+    e->next        = proto_table;
+    proto_table    = e;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1127,11 +1130,14 @@ static struct Node *parse_program(void) {
             /* parse parameter list */
             expect(TK_LPAREN, "expected '('");
             struct Node *params = NULL, *ptail = NULL;
-            int   arity  = 0;
+            int   arity     = 0;
+            bool  variadic  = false;
 
             if (!check(TK_RPAREN)) {
                 do {
                     if (check(TK_RPAREN)) break;
+                    /* variadic marker */
+                    if (match(TK_ELLIPSIS)) { variadic = true; break; }
                     struct Type *pbase  = parse_type_spec();
                     char *pname  = NULL;
                     struct Type *ptype  = parse_declarator(pbase, &pname);
@@ -1148,18 +1154,19 @@ static struct Node *parse_program(void) {
 
             /* prototype */
             if (match(TK_SEMI)) {
-                add_proto(name, base, arity);
+                add_proto(name, base, arity, variadic);
                 continue;
             }
 
             /* function definition */
-            add_proto(name, base, arity);
+            add_proto(name, base, arity, variadic);
             struct Node *fn = new_node(ND_FUNC);
-            fn->name   = name;
-            fn->type   = base;
-            fn->params = params;
-            fn->ival   = arity;
-            fn->body   = parse_block();
+            fn->name        = name;
+            fn->type        = base;
+            fn->params      = params;
+            fn->ival        = arity;
+            fn->is_variadic = variadic;
+            fn->body        = parse_block();
             fn->next   = NULL;
             if (!head) head = tail = fn;
             else { tail->next = fn; tail = fn; }
@@ -1228,6 +1235,10 @@ static void resolve_expr(struct Node *n) {
             struct ProtoEntry *pe = find_proto(n->name);
             if (!pe) die("call to undeclared function '%s'", n->name);
             n->type = pe->ret_type;
+            /* for variadic functions accept any number of args >= arity */
+            if (!pe->is_variadic && pe->arity >= 0 && (int)n->ival != pe->arity)
+                die("wrong number of arguments to '%s' (expected %d, got %d)",
+                    n->name, pe->arity, (int)n->ival);
             for (struct Node *a = n->args; a; a = a->next) resolve_expr(a);
             break;
         }
@@ -1624,20 +1635,51 @@ static void gen_expr(struct Node *n) {
             return;
         }
         case ND_CALL: {
-            /* push args right to left */
+            /* collect args */
             int argc = 0;
-            struct Node *args[16];
-            for (struct Node *a = n->args; a; a = a->next) args[argc++] = a;
-            /* evaluate args and put in registers */
-            for (int i = argc - 1; i >= 0; i--) {
+            struct Node *args[64];
+            for (struct Node *a = n->args; a; a = a->next) {
+                if (argc < 64) args[argc] = a;
+                argc++;
+            }
+
+            /* System V AMD64: first 6 integer args in registers,
+               remainder pushed on stack right-to-left.
+               Stack must be 16-byte aligned before call.
+               For variadic functions al = number of XMM args used (0 here). */
+            int stack_args = argc > 6 ? argc - 6 : 0;
+            /* align: after pushes the stack moves by stack_args*8;
+               we add a padding push if needed */
+            int pad = (stack_args % 2 != 0) ? 1 : 0;
+            if (pad) emit("  subq $8, %%rsp");
+
+            /* push stack args right-to-left */
+            for (int i = argc - 1; i >= 6; i--) {
                 gen_expr(args[i]);
                 emit("  pushq %%rax");
             }
-            for (int i = 0; i < argc && i < 6; i++) {
-                emit("  popq %%%s", arg_regs[i]);
+
+            /* evaluate register args, push temporarily */
+            int reg_args = argc < 6 ? argc : 6;
+            for (int i = reg_args - 1; i >= 0; i--) {
+                gen_expr(args[i]);
+                emit("  pushq %%rax");
             }
-            emit("  xorq %%rax, %%rax");  /* al = 0 (no xmm args) */
+            for (int i = 0; i < reg_args; i++)
+                emit("  popq %%%s", arg_regs[i]);
+
+            /* look up whether this is variadic */
+            struct ProtoEntry *pe = find_proto(n->name);
+            bool is_var = pe && pe->is_variadic;
+            if (is_var)
+                emit("  xorq %%rax, %%rax");  /* al=0: no XMM args */
+            else
+                emit("  xorq %%rax, %%rax");  /* keep rax clear */
             emit("  callq %s", n->name);
+
+            /* clean up stack args + padding */
+            int cleanup = (stack_args + pad) * 8;
+            if (cleanup) emit("  addq $%d, %%rsp", cleanup);
             return;
         }
         case ND_INDEX:
@@ -1889,8 +1931,8 @@ int main(int argc, char **argv) {
 
     /* builtin declarations: malloc and free */
     push_scope();
-    add_proto("malloc", ptr_to(ty_void), 1);
-    add_proto("free",   ty_void,         1);
+    add_proto("malloc", ptr_to(ty_void), 1, false);
+    add_proto("free",   ty_void,         1, false);
 
     src     = read_file(argv[1]);
     src_pos = 0;
