@@ -91,8 +91,9 @@ struct Token {
     int       line;
     /* value */
     char     *sval;   /* TK_IDENT, TK_STR_LIT */
-    long      ival;   /* TK_INT_LIT, TK_CHAR_LIT */
+    long long ival;   /* TK_INT_LIT, TK_CHAR_LIT */
     double    fval;   /* TK_FLOAT_LIT */
+    bool      is_float; /* TK_FLOAT_LIT: true=float(f suffix), false=double */
 };
 
 /* ------------------------------------------------------------------ */
@@ -171,7 +172,7 @@ static void lex_all(void) {
 
         /* integer / float literals */
         if (isdigit((unsigned char)c)) {
-            long ival = 0;
+            long long ival = 0;
             /* hex: c=='0', next is 'x'/'X' */
             if (c == '0' && (src[src_pos+1] == 'x' || src[src_pos+1] == 'X')) {
                 lnext(); lnext(); /* consume '0' and 'x' */
@@ -205,7 +206,7 @@ static void lex_all(void) {
             if (lpeek() == '.' || lpeek() == 'e' || lpeek() == 'E') {
                 /* float */
                 char buf[64]; int bi = 0;
-                sprintf(buf, "%ld", ival);
+                sprintf(buf, "%lld", ival);
                 bi = (int)strlen(buf);
                 if (lpeek() == '.') { buf[bi++] = lnext(); }
                 while (isdigit((unsigned char)lpeek())) buf[bi++] = lnext();
@@ -217,6 +218,10 @@ static void lex_all(void) {
                 buf[bi] = '\0';
                 t.kind = TK_FLOAT_LIT;
                 t.fval = atof(buf);
+                /* consume optional f/F (float) or l/L (long double, treated as double) suffix */
+                if (lpeek() == 'f' || lpeek() == 'F') { lnext(); t.is_float = true; }
+                else if (lpeek() == 'l' || lpeek() == 'L') { lnext(); t.is_float = false; }
+                else { t.is_float = false; }
             } else {
                 /* skip L/U suffixes */
                 while (lpeek() == 'l' || lpeek() == 'L' ||
@@ -232,7 +237,7 @@ static void lex_all(void) {
         /* char literal */
         if (c == '\'') {
             lnext();
-            long val = 0;
+            long long val = 0;
             if (lpeek() == '\\') {
                 lnext();
                 char e = lnext();
@@ -394,7 +399,7 @@ static struct Token *expect(enum TokenKind k, const char *msg) {
 /* ------------------------------------------------------------------ */
 
 enum TypeKind {
-    TY_VOID, TY_CHAR, TY_SHORT, TY_INT, TY_LONG,
+    TY_VOID, TY_CHAR, TY_SHORT, TY_INT, TY_LONG, TY_LONGLONG,
     TY_FLOAT, TY_DOUBLE, TY_UNSIGNED,
     TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_FUNC,
 };
@@ -427,6 +432,7 @@ static struct Type *ty_char;
 static struct Type *ty_short;
 static struct Type *ty_int;
 static struct Type *ty_long;
+static struct Type *ty_longlong;
 static struct Type *ty_float;
 static struct Type *ty_double;
 
@@ -437,13 +443,14 @@ static struct Type *new_type(enum TypeKind k) {
 }
 
 static void init_types(void) {
-    ty_void   = new_type(TY_VOID);   ty_void->size  = 0;  ty_void->align  = 1;
-    ty_char   = new_type(TY_CHAR);   ty_char->size  = 1;  ty_char->align  = 1;
-    ty_short  = new_type(TY_SHORT);  ty_short->size = 2;  ty_short->align = 2;
-    ty_int    = new_type(TY_INT);    ty_int->size   = 4;  ty_int->align   = 4;
-    ty_long   = new_type(TY_LONG);   ty_long->size  = 8;  ty_long->align  = 8;
-    ty_float  = new_type(TY_FLOAT);  ty_float->size = 4;  ty_float->align = 4;
-    ty_double = new_type(TY_DOUBLE); ty_double->size= 8;  ty_double->align= 8;
+    ty_void   = new_type(TY_VOID);     ty_void->size  = 0;  ty_void->align  = 1;
+    ty_char   = new_type(TY_CHAR);     ty_char->size  = 1;  ty_char->align  = 1;
+    ty_short  = new_type(TY_SHORT);    ty_short->size = 2;  ty_short->align = 2;
+    ty_int    = new_type(TY_INT);      ty_int->size   = 4;  ty_int->align   = 4;
+    ty_long   = new_type(TY_LONG);     ty_long->size  = 8;  ty_long->align  = 8;
+    ty_longlong = new_type(TY_LONGLONG); ty_longlong->size = 8; ty_longlong->align = 8;
+    ty_float  = new_type(TY_FLOAT);    ty_float->size = 4;  ty_float->align = 4;
+    ty_double = new_type(TY_DOUBLE);   ty_double->size= 8;  ty_double->align= 8;
 }
 
 static struct Type *ptr_to(struct Type *base) {
@@ -510,8 +517,8 @@ struct Node {
     struct Type    *type;    /* resolved type (filled in symbol resolution) */
 
     /* literals */
-    long     ival;
-    double   fval;
+    long long ival;
+    double    fval;
     char    *sval;
 
     /* general children */
@@ -539,6 +546,7 @@ struct Node {
     /* declaration */
     bool     is_local;
     bool     is_variadic; /* for ND_FUNC: has ... parameter */
+    bool     is_float;    /* for ND_FLOAT: true=float, false=double */
     int      offset;  /* stack offset for locals (negative from rbp) */
 };
 
@@ -652,6 +660,7 @@ static struct Node *parse_expr(void);
 static struct Node *parse_stmt(void);
 static struct Type *parse_type_spec(void);
 static struct Type *parse_declarator(struct Type *base, char **name_out);
+static struct Member *find_member(struct Type *t, const char *name);
 
 /* ------------------------------------------------------------------ */
 /* Parser -- types                                                      */
@@ -755,7 +764,12 @@ static struct Type *parse_type_spec(void) {
         case TK_CHAR:   advance(); base = ty_char;   break;
         case TK_SHORT:  advance(); base = ty_short;  break;
         case TK_INT:    advance(); base = ty_int;    break;
-        case TK_LONG:   advance(); base = ty_long;   break;
+        case TK_LONG:
+            advance();
+            /* check for 'long long' */
+            if (check(TK_LONG)) { advance(); base = ty_longlong; }
+            else                 { base = ty_long; }
+            break;
         case TK_FLOAT:  advance(); base = ty_float;  break;
         case TK_DOUBLE: advance(); base = ty_double; break;
         case TK_STRUCT: advance(); base = parse_struct_or_union(false); break;
@@ -843,6 +857,7 @@ static struct Node *parse_primary(void) {
         advance();
         n = new_node(ND_FLOAT);
         n->fval = t->fval;
+        n->is_float = t->is_float;
         return n;
     }
     if (t->kind == TK_STR_LIT) {
@@ -1267,7 +1282,13 @@ static void resolve_expr(struct Node *n) {
             }
             break;
         }
-        case ND_INT: case ND_FLOAT: case ND_STR:
+        case ND_INT:
+            n->type = ty_int;
+            break;
+        case ND_FLOAT:
+            n->type = n->is_float ? ty_float : ty_double;
+            break;
+        case ND_STR:
             break;
         case ND_UNARY: case ND_PREINC: case ND_PREDEC:
         case ND_POSTINC: case ND_POSTDEC:
@@ -1328,10 +1349,25 @@ static void resolve_expr(struct Node *n) {
                     n->type = n->lhs->type;
             }
             break;
-        case ND_MEMBER: case ND_ARROW:
+        case ND_MEMBER: {
             resolve_expr(n->lhs);
-            /* member offset resolved in codegen via type */
+            struct Type *st = n->lhs->type;
+            if (st && (st->kind == TY_STRUCT || st->kind == TY_UNION)) {
+                struct Member *m = find_member(st, n->name);
+                if (m) n->type = m->type;
+            }
             break;
+        }
+        case ND_ARROW: {
+            resolve_expr(n->lhs);
+            struct Type *st = n->lhs->type;
+            if (st && st->kind == TY_PTR) st = st->base;
+            if (st && (st->kind == TY_STRUCT || st->kind == TY_UNION)) {
+                struct Member *m = find_member(st, n->name);
+                if (m) n->type = m->type;
+            }
+            break;
+        }
         case ND_CAST:
             resolve_expr(n->lhs);
             break;
@@ -1450,6 +1486,16 @@ static const char *arg_regs8[] = {
 
 static int new_label(void) { return label_count++; }
 
+/* Returns true if this type should use XMM (float/double) registers */
+static bool is_float_type(struct Type *t) {
+    return t && (t->kind == TY_FLOAT || t->kind == TY_DOUBLE);
+}
+
+/* Returns true if this node produces a float/double value */
+static bool node_is_float(struct Node *n) {
+    return n && is_float_type(n->type);
+}
+
 static void emit(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -1546,22 +1592,30 @@ static void gen_addr(struct Node *n) {
 static void gen_expr(struct Node *n) {
     switch (n->kind) {
         case ND_INT:
-            emit("  movq $%ld, %%rax", n->ival);
+            emit("  movq $%lld, %%rax", n->ival);
             return;
-        case ND_FLOAT:
-            /* store float in .rodata and load */
-            {
-                int lbl = new_label();
-                emit("  .section .rodata");
-                emit(".LC%d:", lbl);
-                /* emit 8-byte IEEE double */
+        case ND_FLOAT: {
+            /* store constant in .rodata and load into xmm0 */
+            int lbl = new_label();
+            emit("  .section .rodata");
+            emit(".LC%d:", lbl);
+            if (n->is_float) {
+                /* 4-byte IEEE single */
+                union { float f; uint32_t u; } u;
+                u.f = (float)n->fval;
+                emit("  .long %u", u.u);
+                emit("  .text");
+                emit("  movss .LC%d(%%rip), %%xmm0", lbl);
+            } else {
+                /* 8-byte IEEE double */
                 union { double d; uint64_t u; } u;
                 u.d = n->fval;
-                emit("  .quad %lu", (unsigned long)u.u);
+                emit("  .quad %llu", (unsigned long long)u.u);
                 emit("  .text");
                 emit("  movsd .LC%d(%%rip), %%xmm0", lbl);
             }
             return;
+        }
         case ND_STR: {
             int lbl = new_label();
             emit("  .section .rodata");
@@ -1575,7 +1629,13 @@ static void gen_expr(struct Node *n) {
             gen_addr(n);
             /* arrays decay to pointer (their address); scalars get loaded */
             if (n->type && n->type->kind == TY_ARRAY) {
-                /* rax already holds the address — that is the value */
+                return;
+            }
+            if (is_float_type(n->type)) {
+                if (n->type->kind == TY_FLOAT)
+                    emit("  movss (%%rax), %%xmm0");
+                else
+                    emit("  movsd (%%rax), %%xmm0");
                 return;
             }
             {
@@ -1592,6 +1652,13 @@ static void gen_expr(struct Node *n) {
             return;
         case ND_INDEX:
             gen_addr(n);
+            if (is_float_type(n->type)) {
+                if (n->type->kind == TY_FLOAT)
+                    emit("  movss (%%rax), %%xmm0");
+                else
+                    emit("  movsd (%%rax), %%xmm0");
+                return;
+            }
             {
                 int sz = n->type ? type_size(n->type) : 8;
                 if (sz == 8)       emit("  movq (%%rax), %%rax");
@@ -1605,6 +1672,13 @@ static void gen_expr(struct Node *n) {
             return;
         case ND_DEREF:
             gen_expr(n->lhs);
+            if (is_float_type(n->type)) {
+                if (n->type->kind == TY_FLOAT)
+                    emit("  movss (%%rax), %%xmm0");
+                else
+                    emit("  movsd (%%rax), %%xmm0");
+                return;
+            }
             {
                 int sz = n->type ? type_size(n->type) : 8;
                 if (sz == 8)      emit("  movq (%%rax), %%rax");
@@ -1615,6 +1689,38 @@ static void gen_expr(struct Node *n) {
             return;
         case ND_UNARY:
             gen_expr(n->lhs);
+            if (node_is_float(n->lhs)) {
+                /* float/double negate: XOR sign bit */
+                bool is_f = (n->lhs->type->kind == TY_FLOAT);
+                if (n->op == TK_MINUS) {
+                    int lbl = new_label();
+                    emit("  .section .rodata");
+                    emit(".LC%d:", lbl);
+                    if (is_f) {
+                        emit("  .long 0x80000000");   /* float sign mask */
+                        emit("  .text");
+                        emit("  movss .LC%d(%%rip), %%xmm1", lbl);
+                        emit("  xorps %%xmm1, %%xmm0");
+                    } else {
+                        emit("  .quad 0x8000000000000000"); /* double sign mask */
+                        emit("  .text");
+                        emit("  movsd .LC%d(%%rip), %%xmm1", lbl);
+                        emit("  xorpd %%xmm1, %%xmm0");
+                    }
+                } else if (n->op == TK_BANG) {
+                    /* !f: compare to 0.0, result is int in rax */
+                    if (is_f) {
+                        emit("  xorps %%xmm1, %%xmm1");
+                        emit("  ucomiss %%xmm1, %%xmm0");
+                    } else {
+                        emit("  xorpd %%xmm1, %%xmm1");
+                        emit("  ucomisd %%xmm1, %%xmm0");
+                    }
+                    emit("  sete %%al");
+                    emit("  movzbq %%al, %%rax");
+                }
+                return;
+            }
             switch (n->op) {
                 case TK_MINUS: emit("  negq %%rax"); break;
                 case TK_BANG:
@@ -1627,6 +1733,161 @@ static void gen_expr(struct Node *n) {
             }
             return;
         case ND_BINARY: {
+            /* short-circuit && and || -- always produce int result */
+            if (n->op == TK_AND) {
+                int lbl = new_label();
+                gen_expr(n->lhs);
+                /* test lhs: for float, compare to 0 */
+                if (node_is_float(n->lhs)) {
+                    bool is_f = (n->lhs->type->kind == TY_FLOAT);
+                    if (is_f) { emit("  xorps %%xmm1, %%xmm1"); emit("  ucomiss %%xmm1, %%xmm0"); }
+                    else      { emit("  xorpd %%xmm1, %%xmm1"); emit("  ucomisd %%xmm1, %%xmm0"); }
+                    emit("  sete %%al"); emit("  movzbq %%al, %%rax");
+                    emit("  cmpq $0, %%rax");
+                } else {
+                    emit("  cmpq $0, %%rax");
+                }
+                emit("  je .Lfalse%d", lbl);
+                gen_expr(n->rhs);
+                if (node_is_float(n->rhs)) {
+                    bool is_f = (n->rhs->type->kind == TY_FLOAT);
+                    if (is_f) { emit("  xorps %%xmm1, %%xmm1"); emit("  ucomiss %%xmm1, %%xmm0"); }
+                    else      { emit("  xorpd %%xmm1, %%xmm1"); emit("  ucomisd %%xmm1, %%xmm0"); }
+                    emit("  sete %%al"); emit("  movzbq %%al, %%rax");
+                    emit("  cmpq $0, %%rax");
+                } else {
+                    emit("  cmpq $0, %%rax");
+                }
+                emit("  je .Lfalse%d", lbl);
+                emit("  movq $1, %%rax");
+                emit("  jmp .Lend%d", lbl);
+                emit(".Lfalse%d:", lbl);
+                emit("  xorq %%rax, %%rax");
+                emit(".Lend%d:", lbl);
+                return;
+            }
+            if (n->op == TK_OR) {
+                int lbl = new_label();
+                gen_expr(n->lhs);
+                if (node_is_float(n->lhs)) {
+                    bool is_f = (n->lhs->type->kind == TY_FLOAT);
+                    if (is_f) { emit("  xorps %%xmm1, %%xmm1"); emit("  ucomiss %%xmm1, %%xmm0"); }
+                    else      { emit("  xorpd %%xmm1, %%xmm1"); emit("  ucomisd %%xmm1, %%xmm0"); }
+                    emit("  setne %%al"); emit("  movzbq %%al, %%rax");
+                    emit("  cmpq $0, %%rax");
+                } else {
+                    emit("  cmpq $0, %%rax");
+                }
+                emit("  jne .Ltrue%d", lbl);
+                gen_expr(n->rhs);
+                if (node_is_float(n->rhs)) {
+                    bool is_f = (n->rhs->type->kind == TY_FLOAT);
+                    if (is_f) { emit("  xorps %%xmm1, %%xmm1"); emit("  ucomiss %%xmm1, %%xmm0"); }
+                    else      { emit("  xorpd %%xmm1, %%xmm1"); emit("  ucomisd %%xmm1, %%xmm0"); }
+                    emit("  setne %%al"); emit("  movzbq %%al, %%rax");
+                    emit("  cmpq $0, %%rax");
+                } else {
+                    emit("  cmpq $0, %%rax");
+                }
+                emit("  jne .Ltrue%d", lbl);
+                emit("  xorq %%rax, %%rax");
+                emit("  jmp .Lend%d", lbl);
+                emit(".Ltrue%d:", lbl);
+                emit("  movq $1, %%rax");
+                emit(".Lend%d:", lbl);
+                return;
+            }
+
+            /* float/double arithmetic */
+            bool lhs_float = node_is_float(n->lhs);
+            bool rhs_float = node_is_float(n->rhs);
+            if (lhs_float || rhs_float) {
+                bool use_double = (n->lhs->type && n->lhs->type->kind == TY_DOUBLE) ||
+                                  (n->rhs->type && n->rhs->type->kind == TY_DOUBLE);
+                /* evaluate rhs -> xmm0, push to stack (8 bytes), then lhs -> xmm0 */
+                gen_expr(n->rhs);
+                /* if rhs is int, convert to float/double */
+                if (!rhs_float) {
+                    if (use_double) emit("  cvtsi2sdq %%rax, %%xmm0");
+                    else            emit("  cvtsi2ssq %%rax, %%xmm0");
+                } else if (!use_double && n->rhs->type->kind == TY_FLOAT && use_double) {
+                    emit("  cvtss2sd %%xmm0, %%xmm0");
+                }
+                /* spill xmm0 to stack */
+                emit("  subq $8, %%rsp");
+                if (use_double) emit("  movsd %%xmm0, (%%rsp)");
+                else            emit("  movss %%xmm0, (%%rsp)");
+
+                gen_expr(n->lhs);
+                if (!lhs_float) {
+                    if (use_double) emit("  cvtsi2sdq %%rax, %%xmm0");
+                    else            emit("  cvtsi2ssq %%rax, %%xmm0");
+                } else if (!use_double && n->lhs->type->kind == TY_FLOAT && use_double) {
+                    emit("  cvtss2sd %%xmm0, %%xmm0");
+                }
+                /* reload rhs into xmm1 */
+                if (use_double) emit("  movsd (%%rsp), %%xmm1");
+                else            emit("  movss (%%rsp), %%xmm1");
+                emit("  addq $8, %%rsp");
+
+                /* now: xmm0=lhs, xmm1=rhs */
+                if (use_double) {
+                    switch (n->op) {
+                        case TK_PLUS:  emit("  addsd %%xmm1, %%xmm0"); break;
+                        case TK_MINUS: emit("  subsd %%xmm1, %%xmm0"); break;
+                        case TK_STAR:  emit("  mulsd %%xmm1, %%xmm0"); break;
+                        case TK_SLASH: emit("  divsd %%xmm1, %%xmm0"); break;
+                        case TK_EQ:
+                            emit("  ucomisd %%xmm1, %%xmm0");
+                            emit("  sete %%al"); emit("  movzbq %%al, %%rax"); break;
+                        case TK_NEQ:
+                            emit("  ucomisd %%xmm1, %%xmm0");
+                            emit("  setne %%al"); emit("  movzbq %%al, %%rax"); break;
+                        case TK_LT:
+                            emit("  ucomisd %%xmm1, %%xmm0");
+                            emit("  setb %%al"); emit("  movzbq %%al, %%rax"); break;
+                        case TK_GT:
+                            emit("  ucomisd %%xmm0, %%xmm1");
+                            emit("  setb %%al"); emit("  movzbq %%al, %%rax"); break;
+                        case TK_LEQ:
+                            emit("  ucomisd %%xmm1, %%xmm0");
+                            emit("  setbe %%al"); emit("  movzbq %%al, %%rax"); break;
+                        case TK_GEQ:
+                            emit("  ucomisd %%xmm0, %%xmm1");
+                            emit("  setbe %%al"); emit("  movzbq %%al, %%rax"); break;
+                        default: die("unsupported operator on double"); break;
+                    }
+                } else {
+                    switch (n->op) {
+                        case TK_PLUS:  emit("  addss %%xmm1, %%xmm0"); break;
+                        case TK_MINUS: emit("  subss %%xmm1, %%xmm0"); break;
+                        case TK_STAR:  emit("  mulss %%xmm1, %%xmm0"); break;
+                        case TK_SLASH: emit("  divss %%xmm1, %%xmm0"); break;
+                        case TK_EQ:
+                            emit("  ucomiss %%xmm1, %%xmm0");
+                            emit("  sete %%al"); emit("  movzbq %%al, %%rax"); break;
+                        case TK_NEQ:
+                            emit("  ucomiss %%xmm1, %%xmm0");
+                            emit("  setne %%al"); emit("  movzbq %%al, %%rax"); break;
+                        case TK_LT:
+                            emit("  ucomiss %%xmm1, %%xmm0");
+                            emit("  setb %%al"); emit("  movzbq %%al, %%rax"); break;
+                        case TK_GT:
+                            emit("  ucomiss %%xmm0, %%xmm1");
+                            emit("  setb %%al"); emit("  movzbq %%al, %%rax"); break;
+                        case TK_LEQ:
+                            emit("  ucomiss %%xmm1, %%xmm0");
+                            emit("  setbe %%al"); emit("  movzbq %%al, %%rax"); break;
+                        case TK_GEQ:
+                            emit("  ucomiss %%xmm0, %%xmm1");
+                            emit("  setbe %%al"); emit("  movzbq %%al, %%rax"); break;
+                        default: die("unsupported operator on float"); break;
+                    }
+                }
+                return;
+            }
+
+            /* integer arithmetic (original path) */
             /* detect pointer arithmetic: ptr +/- int needs scaling */
             bool lhs_is_ptr = n->lhs->type &&
                               (n->lhs->type->kind == TY_PTR ||
@@ -1636,10 +1897,10 @@ static void gen_expr(struct Node *n) {
                                n->rhs->type->kind == TY_ARRAY);
             int ptr_scale = 1;
             if ((n->op == TK_PLUS || n->op == TK_MINUS) && lhs_is_ptr && !rhs_is_ptr) {
-                struct Type *base = n->lhs->type->kind == TY_PTR
-                                    ? n->lhs->type->base : n->lhs->type->base;
+                struct Type *base = n->lhs->type->base;
                 if (base) ptr_scale = type_size(base);
             }
+            (void)rhs_is_ptr;
 
             gen_expr(n->rhs);
             if (ptr_scale > 1) emit("  imulq $%d, %%rax", ptr_scale);
@@ -1694,53 +1955,90 @@ static void gen_expr(struct Node *n) {
                     emit("  setge %%al");
                     emit("  movzbq %%al, %%rax");
                     break;
-                case TK_AND: {
-                    int lbl = new_label();
-                    emit("  cmpq $0, %%rax");
-                    emit("  je .Lfalse%d", lbl);
-                    emit("  cmpq $0, %%rcx");
-                    emit("  je .Lfalse%d", lbl);
-                    emit("  movq $1, %%rax");
-                    emit("  jmp .Lend%d", lbl);
-                    emit(".Lfalse%d:", lbl);
-                    emit("  xorq %%rax, %%rax");
-                    emit(".Lend%d:", lbl);
-                    break;
-                }
-                case TK_OR: {
-                    int lbl = new_label();
-                    emit("  cmpq $0, %%rax");
-                    emit("  jne .Ltrue%d", lbl);
-                    emit("  cmpq $0, %%rcx");
-                    emit("  jne .Ltrue%d", lbl);
-                    emit("  xorq %%rax, %%rax");
-                    emit("  jmp .Lend%d", lbl);
-                    emit(".Ltrue%d:", lbl);
-                    emit("  movq $1, %%rax");
-                    emit(".Lend%d:", lbl);
-                    break;
-                }
                 default: break;
             }
             return;
         }
         case ND_ASSIGN: {
+            bool lhs_float = is_float_type(n->lhs->type);
+            if (lhs_float) {
+                bool is_d = (n->lhs->type->kind == TY_DOUBLE);
+                /* evaluate rhs into xmm0 */
+                gen_expr(n->rhs);
+                /* convert if rhs is integer */
+                if (!node_is_float(n->rhs)) {
+                    if (is_d) emit("  cvtsi2sdq %%rax, %%xmm0");
+                    else      emit("  cvtsi2ssq %%rax, %%xmm0");
+                } else if (is_d && n->rhs->type && n->rhs->type->kind == TY_FLOAT) {
+                    emit("  cvtss2sd %%xmm0, %%xmm0");
+                } else if (!is_d && n->rhs->type && n->rhs->type->kind == TY_DOUBLE) {
+                    emit("  cvtsd2ss %%xmm0, %%xmm0");
+                }
+                /* spill xmm0, get address, restore */
+                emit("  subq $8, %%rsp");
+                if (is_d) emit("  movsd %%xmm0, (%%rsp)");
+                else      emit("  movss %%xmm0, (%%rsp)");
+                gen_addr(n->lhs);
+                if (is_d) {
+                    emit("  movsd (%%rsp), %%xmm0");
+                    emit("  addq $8, %%rsp");
+                    if (n->op == TK_ASSIGN) {
+                        emit("  movsd %%xmm0, (%%rax)");
+                    } else {
+                        /* compound float assign */
+                        emit("  movsd (%%rax), %%xmm1");
+                        switch (n->op) {
+                            case TK_PLUS_ASSIGN:  emit("  addsd %%xmm0, %%xmm1"); break;
+                            case TK_MINUS_ASSIGN: emit("  subsd %%xmm0, %%xmm1"); break;
+                            case TK_STAR_ASSIGN:  emit("  mulsd %%xmm0, %%xmm1"); break;
+                            case TK_SLASH_ASSIGN: emit("  divsd %%xmm0, %%xmm1"); break;
+                            default: die("unsupported compound assign on double"); break;
+                        }
+                        emit("  movsd %%xmm1, (%%rax)");
+                        emit("  movsd %%xmm1, %%xmm0");
+                    }
+                } else {
+                    emit("  movss (%%rsp), %%xmm0");
+                    emit("  addq $8, %%rsp");
+                    if (n->op == TK_ASSIGN) {
+                        emit("  movss %%xmm0, (%%rax)");
+                    } else {
+                        emit("  movss (%%rax), %%xmm1");
+                        switch (n->op) {
+                            case TK_PLUS_ASSIGN:  emit("  addss %%xmm0, %%xmm1"); break;
+                            case TK_MINUS_ASSIGN: emit("  subss %%xmm0, %%xmm1"); break;
+                            case TK_STAR_ASSIGN:  emit("  mulss %%xmm0, %%xmm1"); break;
+                            case TK_SLASH_ASSIGN: emit("  divss %%xmm0, %%xmm1"); break;
+                            default: die("unsupported compound assign on float"); break;
+                        }
+                        emit("  movss %%xmm1, (%%rax)");
+                        emit("  movss %%xmm1, %%xmm0");
+                    }
+                }
+                return;
+            }
+            /* integer assign (original path) */
             gen_expr(n->rhs);
+            /* if rhs is float and lhs is int, convert */
+            if (node_is_float(n->rhs)) {
+                if (n->rhs->type->kind == TY_FLOAT)
+                    emit("  cvttss2siq %%xmm0, %%rax");
+                else
+                    emit("  cvttsd2siq %%xmm0, %%rax");
+            }
             emit("  pushq %%rax");
             gen_addr(n->lhs);
             emit("  popq %%rcx");
             if (n->op != TK_ASSIGN) {
-                /* compound: load current lhs value */
                 int sz = n->lhs->type ? type_size(n->lhs->type) : 8;
-                emit("  pushq %%rax");  /* save addr */
+                emit("  pushq %%rax");
                 if      (sz == 8) emit("  movq (%%rax), %%rax");
                 else if (sz == 4) emit("  movslq (%%rax), %%rax");
                 else if (sz == 2) emit("  movswq (%%rax), %%rax");
                 else              emit("  movsbq (%%rax), %%rax");
-                emit("  pushq %%rax");  /* save lhs val */
-                emit("  movq %%rcx, %%rax"); /* rhs -> rax */
-                emit("  popq %%rcx");   /* lhs -> rcx */
-                /* now rax=rhs, rcx=lhs -- swap for operation */
+                emit("  pushq %%rax");
+                emit("  movq %%rcx, %%rax");
+                emit("  popq %%rcx");
                 emit("  xchgq %%rax, %%rcx");
                 switch (n->op) {
                     case TK_PLUS_ASSIGN:   emit("  addq %%rcx, %%rax"); break;
@@ -1755,10 +2053,9 @@ static void gen_expr(struct Node *n) {
                     case TK_RSHIFT_ASSIGN: emit("  sarq %%cl,  %%rax"); break;
                     default: break;
                 }
-                emit("  movq %%rax, %%rcx");  /* result -> rcx */
-                emit("  popq %%rax");          /* addr */
+                emit("  movq %%rax, %%rcx");
+                emit("  popq %%rax");
             }
-            /* size-aware store based on lhs type */
             {
                 int sz = n->lhs->type ? type_size(n->lhs->type) : 8;
                 if (sz == 8)      emit("  movq %%rcx, (%%rax)");
@@ -1772,6 +2069,13 @@ static void gen_expr(struct Node *n) {
         case ND_TERNARY: {
             int lbl = new_label();
             gen_expr(n->cond);
+            /* test cond (may be float) */
+            if (node_is_float(n->cond)) {
+                bool is_f = (n->cond->type->kind == TY_FLOAT);
+                if (is_f) { emit("  xorps %%xmm1, %%xmm1"); emit("  ucomiss %%xmm1, %%xmm0"); }
+                else      { emit("  xorpd %%xmm1, %%xmm1"); emit("  ucomisd %%xmm1, %%xmm0"); }
+                emit("  sete %%al"); emit("  movzbq %%al, %%rax");
+            }
             emit("  cmpq $0, %%rax");
             emit("  je .Lelse%d", lbl);
             gen_expr(n->then);
@@ -1790,48 +2094,139 @@ static void gen_expr(struct Node *n) {
                 argc++;
             }
 
-            /* System V AMD64: first 6 integer args in registers,
-               remainder pushed on stack right-to-left.
-               Stack must be 16-byte aligned before call.
-               For variadic functions al = number of XMM args used (0 here). */
-            int stack_args = argc > 6 ? argc - 6 : 0;
-            /* align: after pushes the stack moves by stack_args*8;
-               we add a padding push if needed */
-            int pad = (stack_args % 2 != 0) ? 1 : 0;
+            /* System V AMD64 ABI:
+               - integer/pointer args: rdi, rsi, rdx, rcx, r8, r9
+               - float/double args:    xmm0..xmm7
+               - stack args: right-to-left
+               - for variadic: al = number of XMM registers used */
+            int int_arg_idx = 0;
+            int xmm_arg_idx = 0;
+
+            /* count stack args: args beyond first 6 int + 8 xmm go on stack */
+            /* simplified: track separately */
+            int stack_argc = 0;
+            {
+                int ii = 0, xi = 0;
+                for (int i = 0; i < argc; i++) {
+                    if (is_float_type(args[i]->type)) {
+                        if (xi < 8) xi++; else stack_argc++;
+                    } else {
+                        if (ii < 6) ii++; else stack_argc++;
+                    }
+                }
+            }
+
+            int pad = (stack_argc % 2 != 0) ? 1 : 0;
             if (pad) emit("  subq $8, %%rsp");
 
             /* push stack args right-to-left */
-            for (int i = argc - 1; i >= 6; i--) {
-                gen_expr(args[i]);
-                emit("  pushq %%rax");
+            {
+                int ii = 0, xi = 0;
+                for (int i = argc - 1; i >= 0; i--) {
+                    bool fa = is_float_type(args[i]->type);
+                    int goes_to_reg = fa ? (xi < 8) : (ii < 6);
+                    /* count in forward order first to know register indices */
+                    (void)goes_to_reg;
+                }
+                /* recount forward to find which go to stack */
+                int fwd_ii = 0, fwd_xi = 0;
+                bool is_stack[64] = {false};
+                for (int i = 0; i < argc; i++) {
+                    if (is_float_type(args[i]->type)) {
+                        if (fwd_xi < 8) fwd_xi++; else is_stack[i] = true;
+                    } else {
+                        if (fwd_ii < 6) fwd_ii++; else is_stack[i] = true;
+                    }
+                }
+                for (int i = argc - 1; i >= 0; i--) {
+                    if (!is_stack[i]) continue;
+                    gen_expr(args[i]);
+                    if (is_float_type(args[i]->type)) {
+                        emit("  subq $8, %%rsp");
+                        if (args[i]->type->kind == TY_FLOAT) {
+                            /* widen float to double for stack pass (System V) */
+                            emit("  cvtss2sd %%xmm0, %%xmm0");
+                            emit("  movsd %%xmm0, (%%rsp)");
+                        } else {
+                            emit("  movsd %%xmm0, (%%rsp)");
+                        }
+                    } else {
+                        emit("  pushq %%rax");
+                    }
+                }
             }
 
-            /* evaluate register args, push temporarily */
-            int reg_args = argc < 6 ? argc : 6;
-            for (int i = reg_args - 1; i >= 0; i--) {
-                gen_expr(args[i]);
-                emit("  pushq %%rax");
+            /* evaluate register args and temporarily spill all to stack,
+               then load into the proper registers */
+            /* Spill integer reg args first (right-to-left), then XMM (right-to-left) */
+            {
+                int fwd_ii = 0, fwd_xi = 0;
+                bool is_stack[64] = {false};
+                for (int i = 0; i < argc; i++) {
+                    if (is_float_type(args[i]->type)) {
+                        if (fwd_xi < 8) fwd_xi++; else is_stack[i] = true;
+                    } else {
+                        if (fwd_ii < 6) fwd_ii++; else is_stack[i] = true;
+                    }
+                }
+                int_arg_idx = 0; xmm_arg_idx = 0;
+                /* evaluate and push all register args right-to-left as 8-byte slots */
+                for (int i = argc - 1; i >= 0; i--) {
+                    if (is_stack[i]) continue;
+                    gen_expr(args[i]);
+                    if (is_float_type(args[i]->type)) {
+                        emit("  subq $8, %%rsp");
+                        if (args[i]->type->kind == TY_FLOAT)
+                            emit("  movss %%xmm0, (%%rsp)");
+                        else
+                            emit("  movsd %%xmm0, (%%rsp)");
+                    } else {
+                        emit("  pushq %%rax");
+                    }
+                }
+                /* pop into registers in forward order */
+                for (int i = 0; i < argc; i++) {
+                    if (is_stack[i]) continue;
+                    if (is_float_type(args[i]->type)) {
+                        if (args[i]->type->kind == TY_FLOAT)
+                            emit("  movss (%%rsp), %%xmm%d", xmm_arg_idx);
+                        else
+                            emit("  movsd (%%rsp), %%xmm%d", xmm_arg_idx);
+                        emit("  addq $8, %%rsp");
+                        xmm_arg_idx++;
+                    } else {
+                        emit("  popq %%%s", arg_regs[int_arg_idx]);
+                        int_arg_idx++;
+                    }
+                }
             }
-            for (int i = 0; i < reg_args; i++)
-                emit("  popq %%%s", arg_regs[i]);
 
-            /* look up whether this is variadic */
+            /* for variadic: al = number of XMM args */
             struct ProtoEntry *pe = find_proto(n->name);
             bool is_var = pe && pe->is_variadic;
             if (is_var)
-                emit("  xorq %%rax, %%rax");  /* al=0: no XMM args */
+                emit("  movb $%d, %%al", xmm_arg_idx);
             else
-                emit("  xorq %%rax, %%rax");  /* keep rax clear */
+                emit("  xorq %%rax, %%rax");
             emit("  callq %s", n->name);
 
             /* clean up stack args + padding */
-            int cleanup = (stack_args + pad) * 8;
+            int cleanup = (stack_argc + pad) * 8;
             if (cleanup) emit("  addq $%d, %%rsp", cleanup);
+
+            /* float return: xmm0 already has the result; int return: rax */
             return;
         }
         case ND_MEMBER:
         case ND_ARROW:
             gen_addr(n);
+            if (is_float_type(n->type)) {
+                if (n->type->kind == TY_FLOAT)
+                    emit("  movss (%%rax), %%xmm0");
+                else
+                    emit("  movsd (%%rax), %%xmm0");
+                return;
+            }
             {
                 int sz = n->type ? type_size(n->type) : 8;
                 if (sz == 8)      emit("  movq (%%rax), %%rax");
@@ -1840,30 +2235,115 @@ static void gen_expr(struct Node *n) {
                 else              emit("  movsbq (%%rax), %%rax");
             }
             return;
-        case ND_CAST:
+        case ND_CAST: {
             gen_expr(n->lhs);
+            bool src_float = node_is_float(n->lhs);
+            bool dst_float = is_float_type(n->type);
+            if (src_float && dst_float) {
+                /* float <-> double */
+                bool src_d = (n->lhs->type->kind == TY_DOUBLE);
+                bool dst_d = (n->type->kind == TY_DOUBLE);
+                if (src_d && !dst_d) emit("  cvtsd2ss %%xmm0, %%xmm0");
+                else if (!src_d && dst_d) emit("  cvtss2sd %%xmm0, %%xmm0");
+                /* same kind: no-op */
+            } else if (!src_float && dst_float) {
+                /* int -> float/double */
+                if (n->type->kind == TY_FLOAT) emit("  cvtsi2ssq %%rax, %%xmm0");
+                else                           emit("  cvtsi2sdq %%rax, %%xmm0");
+            } else if (src_float && !dst_float) {
+                /* float/double -> int */
+                if (n->lhs->type->kind == TY_FLOAT) emit("  cvttss2siq %%xmm0, %%rax");
+                else                                emit("  cvttsd2siq %%xmm0, %%rax");
+                /* truncate to target width */
+                int sz = n->type ? type_size(n->type) : 8;
+                if (sz == 1)      emit("  movsbq %%al, %%rax");
+                else if (sz == 2) emit("  movswq %%ax, %%rax");
+                else if (sz == 4) emit("  movslq %%eax, %%rax");
+            }
+            /* int->int cast: rax already has the value; width truncation on use */
             return;
+        }
         case ND_PREINC: case ND_PREDEC:
         case ND_POSTINC: case ND_POSTDEC: {
             gen_addr(n->lhs);
-            int sz = n->type ? type_size(n->type) : 8;
-            /* load */
+            bool fp = is_float_type(n->type);
+            if (fp) {
+                bool is_d = (n->type->kind == TY_DOUBLE);
+                /* load current value */
+                if (is_d) emit("  movsd (%%rax), %%xmm0");
+                else      emit("  movss (%%rax), %%xmm0");
+                /* spill address */
+                emit("  pushq %%rax");
+                /* build constant 1.0 in xmm1 */
+                int lbl = new_label();
+                emit("  .section .rodata");
+                emit(".LC%d:", lbl);
+                if (is_d) {
+                    union { double d; uint64_t u; } u; u.d = 1.0;
+                    emit("  .quad %llu", (unsigned long long)u.u);
+                    emit("  .text");
+                    emit("  movsd .LC%d(%%rip), %%xmm1", lbl);
+                } else {
+                    union { float f; uint32_t u; } u; u.f = 1.0f;
+                    emit("  .long %u", u.u);
+                    emit("  .text");
+                    emit("  movss .LC%d(%%rip), %%xmm1", lbl);
+                }
+                if (n->kind == ND_POSTINC || n->kind == ND_POSTDEC) {
+                    /* save original in xmm2 */
+                    if (is_d) emit("  movsd %%xmm0, %%xmm2");
+                    else      emit("  movss %%xmm0, %%xmm2");
+                    if (n->kind == ND_POSTINC) {
+                        if (is_d) emit("  addsd %%xmm1, %%xmm0");
+                        else      emit("  addss %%xmm1, %%xmm0");
+                    } else {
+                        if (is_d) emit("  subsd %%xmm1, %%xmm0");
+                        else      emit("  subss %%xmm1, %%xmm0");
+                    }
+                    emit("  popq %%rax");
+                    if (is_d) emit("  movsd %%xmm0, (%%rax)");
+                    else      emit("  movss %%xmm0, (%%rax)");
+                    /* return old value */
+                    if (is_d) emit("  movsd %%xmm2, %%xmm0");
+                    else      emit("  movss %%xmm2, %%xmm0");
+                } else {
+                    if (n->kind == ND_PREINC) {
+                        if (is_d) emit("  addsd %%xmm1, %%xmm0");
+                        else      emit("  addss %%xmm1, %%xmm0");
+                    } else {
+                        if (is_d) emit("  subsd %%xmm1, %%xmm0");
+                        else      emit("  subss %%xmm1, %%xmm0");
+                    }
+                    emit("  popq %%rax");
+                    if (is_d) emit("  movsd %%xmm0, (%%rax)");
+                    else      emit("  movss %%xmm0, (%%rax)");
+                }
+                return;
+            }
+            int sz = type_size(n->type);
+            bool is_ptr = n->type && (n->type->kind == TY_PTR || n->type->kind == TY_ARRAY);
+            int step = 1;
+            if (is_ptr) {
+                step = (n->type->base) ? type_size(n->type->base) : 1;
+                if (step < 1) step = 1;
+                sz = 8;
+            }
             if      (sz == 8) emit("  movq (%%rax), %%rcx");
             else if (sz == 4) emit("  movslq (%%rax), %%rcx");
             else if (sz == 2) emit("  movswq (%%rax), %%rcx");
             else              emit("  movsbq (%%rax), %%rcx");
             if (n->kind == ND_POSTINC || n->kind == ND_POSTDEC) {
                 emit("  movq %%rcx, %%rdx");
-                if (n->kind == ND_POSTINC) emit("  incq %%rdx");
-                else                       emit("  decq %%rdx");
+                if (n->kind == ND_POSTINC) emit("  addq $%d, %%rdx", step);
+                else                       emit("  subq $%d, %%rdx", step);
                 if      (sz == 8) emit("  movq  %%rdx, (%%rax)");
                 else if (sz == 4) emit("  movl  %%edx, (%%rax)");
                 else if (sz == 2) emit("  movw  %%dx,  (%%rax)");
                 else              emit("  movb  %%dl,  (%%rax)");
                 emit("  movq %%rcx, %%rax");
             } else {
-                if (n->kind == ND_PREINC) emit("  incq %%rcx");
-                else                      emit("  decq %%rcx");
+                if (n->kind == ND_PREINC) emit("  addq $%d, %%rcx", step);
+                else                      emit("  subq $%d, %%rcx", step);
                 if      (sz == 8) emit("  movq  %%rcx, (%%rax)");
                 else if (sz == 4) emit("  movl  %%ecx, (%%rax)");
                 else if (sz == 2) emit("  movw  %%cx,  (%%rax)");
@@ -2013,18 +2493,28 @@ static void gen_func(struct Node *fn) {
         emit("  subq $%d, %%rsp", frame);
 
     /* move register args to stack slots */
-    int i = 0;
-    for (struct Node *p = fn->params; p; p = p->next, i++) {
-        if (i >= 6) break;
-        int sz = p->type ? type_size(p->type) : 8;
-        if (sz == 8)
-            emit("  movq  %%%s, %d(%%rbp)", arg_regs[i],   p->offset);
-        else if (sz == 4)
-            emit("  movl  %%%s, %d(%%rbp)", arg_regs32[i], p->offset);
-        else if (sz == 2)
-            emit("  movw  %%%s, %d(%%rbp)", arg_regs16[i], p->offset);
-        else
-            emit("  movb  %%%s, %d(%%rbp)", arg_regs8[i],  p->offset);
+    int int_idx = 0, xmm_idx = 0;
+    for (struct Node *p = fn->params; p; p = p->next) {
+        if (is_float_type(p->type)) {
+            if (xmm_idx >= 8) break;
+            if (p->type->kind == TY_FLOAT)
+                emit("  movss %%xmm%d, %d(%%rbp)", xmm_idx, p->offset);
+            else
+                emit("  movsd %%xmm%d, %d(%%rbp)", xmm_idx, p->offset);
+            xmm_idx++;
+        } else {
+            if (int_idx >= 6) break;
+            int sz = p->type ? type_size(p->type) : 8;
+            if (sz == 8)
+                emit("  movq  %%%s, %d(%%rbp)", arg_regs[int_idx],   p->offset);
+            else if (sz == 4)
+                emit("  movl  %%%s, %d(%%rbp)", arg_regs32[int_idx], p->offset);
+            else if (sz == 2)
+                emit("  movw  %%%s, %d(%%rbp)", arg_regs16[int_idx], p->offset);
+            else
+                emit("  movb  %%%s, %d(%%rbp)", arg_regs8[int_idx],  p->offset);
+            int_idx++;
+        }
     }
 
     gen_stmt(fn->body);
@@ -2042,13 +2532,23 @@ static void gen_gvar(struct Node *gv) {
         emit("  .globl %s", gv->name);
         emit("%s:", gv->name);
         int sz = type_size(gv->type);
-        /* only handle integer literals for now */
-        if (gv->init->kind == ND_INT) {
+        if (gv->init->kind == ND_FLOAT) {
+            /* float or double literal initializer */
+            if (sz == 4) {
+                union { float f; uint32_t u; } u;
+                u.f = (float)gv->init->fval;
+                emit("  .long %u", u.u);
+            } else {
+                union { double d; uint64_t u; } u;
+                u.d = gv->init->fval;
+                emit("  .quad %llu", (unsigned long long)u.u);
+            }
+        } else if (gv->init->kind == ND_INT) {
             switch (sz) {
-                case 1: emit("  .byte %ld",  gv->init->ival); break;
-                case 2: emit("  .short %ld", gv->init->ival); break;
-                case 4: emit("  .long %ld",  gv->init->ival); break;
-                default:emit("  .quad %ld",  gv->init->ival); break;
+                case 1: emit("  .byte %lld",  gv->init->ival); break;
+                case 2: emit("  .short %lld", gv->init->ival); break;
+                case 4: emit("  .long %lld",  gv->init->ival); break;
+                default:emit("  .quad %lld",  gv->init->ival); break;
             }
         } else {
             emit("  .zero %d", sz);
