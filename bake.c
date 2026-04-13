@@ -2579,8 +2579,30 @@ static char *read_file(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: krc <input.c>\n");
+    const char *input_path  = NULL;
+    const char *output_path = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: -o requires an argument\n");
+                return 1;
+            }
+            output_path = argv[++i];
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+            return 1;
+        } else {
+            if (input_path) {
+                fprintf(stderr, "error: multiple input files not supported\n");
+                return 1;
+            }
+            input_path = argv[i];
+        }
+    }
+
+    if (!input_path) {
+        fprintf(stderr, "usage: bake [-o output.s] <input.c>\n");
         return 1;
     }
 
@@ -2591,9 +2613,18 @@ int main(int argc, char **argv) {
     add_proto("malloc", ptr_to(ty_void), 1, false);
     add_proto("free",   ty_void,         1, false);
 
-    src     = read_file(argv[1]);
+    src     = read_file(input_path);
     src_pos = 0;
-    out     = stdout;
+
+    if (output_path) {
+        out = fopen(output_path, "w");
+        if (!out) {
+            fprintf(stderr, "error: cannot open output file '%s'\n", output_path);
+            return 1;
+        }
+    } else {
+        out = stdout;
+    }
 
     lex_all();
     struct Node *program = parse_program();
@@ -2616,6 +2647,8 @@ int main(int argc, char **argv) {
             gen_gvar(n);
         }
     }
+
+    if (output_path) fclose(out);
 
     return 0;
 }
