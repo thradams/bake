@@ -421,8 +421,11 @@ struct Type {
     struct Member  *members;
     int      size;       /* total size in bytes */
     int      align;
-    /* func */
+    /* func / func-ptr: return type and parameter types */
     struct Type    *ret;
+    struct Type   **param_types;
+    int      nparams;
+    bool     func_variadic;
     /* unsigned modifier */
     bool     is_unsigned;
 };
@@ -467,6 +470,22 @@ static struct Type *array_of(struct Type *base, int n) {
     t->array_size = n;
     t->size       = base->size * n;
     t->align      = base->align;
+    return t;
+}
+
+/* Build a TY_FUNC type used as the pointee of a function pointer */
+static struct Type *func_type(struct Type *ret, struct Type **params, int nparams, bool variadic) {
+    struct Type *t = new_type(TY_FUNC);
+    t->ret           = ret;
+    t->size          = 8;
+    t->align         = 8;
+    t->nparams       = nparams;
+    t->func_variadic = variadic;
+    if (nparams > 0) {
+        t->param_types = arena_alloc(sizeof(struct Type *) * (size_t)nparams);
+        for (int i = 0; i < nparams; i++)
+            t->param_types[i] = params[i];
+    }
     return t;
 }
 
@@ -542,6 +561,9 @@ struct Node {
 
     /* name (variable, function, label, member) */
     char    *name;
+
+    /* indirect call: expression producing the function pointer */
+    struct Node    *callee;
 
     /* declaration */
     bool     is_local;
@@ -789,28 +811,112 @@ static struct Type *parse_type_spec(void) {
     return base;
 }
 
-/* parse pointer stars and array brackets wrapping a base type */
+/* Forward declaration needed because parse_fp_params calls parse_type_spec */
+static struct Type *parse_type_spec(void);
+
+/* Parse a function-pointer parameter list: (type, type, ...) already past '(' */
+static struct Type *parse_fp_params(struct Type *ret_type, char **name_out_ignored) {
+    /* caller has already consumed the opening '(' of the param list */
+    struct Type *param_buf[64];
+    int nparams = 0;
+    bool variadic = false;
+    if (!check(TK_RPAREN)) {
+        do {
+            if (match(TK_ELLIPSIS)) { variadic = true; break; }
+            struct Type *pb = parse_type_spec();
+            char *dummy = NULL;
+            /* parse_declarator forward-declared below; use recursive call */
+            extern struct Type *parse_declarator(struct Type *, char **);
+            pb = parse_declarator(pb, &dummy);
+            if (nparams < 64) param_buf[nparams++] = pb;
+            if (!check(TK_COMMA)) break;
+        } while (match(TK_COMMA));
+    }
+    expect(TK_RPAREN, "expected ')' after function pointer params");
+    (void)name_out_ignored;
+    return func_type(ret_type, param_buf, nparams, variadic);
+}
+
+/* parse pointer stars and array brackets wrapping a base type.
+   Also handles grouped declarators for function pointers:
+     ret (*name)(params)          -- pointer to function
+     ret (*name[N])(params)       -- array of pointers to function
+*/
 static struct Type *parse_declarator(struct Type *base, char **name_out) {
-    /* pointers */
+    /* leading pointer stars (for plain pointers: int *p) */
     int stars = 0;
     while (match(TK_STAR)) stars++;
 
-    /* optional name */
+    /* grouped declarator: '(' follows the stars (or immediately) and the
+       next token is '*' -- this is (*name...) syntax */
+    if (check(TK_LPAREN) && peek2()->kind == TK_STAR) {
+        advance();          /* consume '(' */
+        int inner_stars = 0;
+        while (match(TK_STAR)) inner_stars++;
+
+        /* name inside parens */
+        char *name = NULL;
+        if (check(TK_IDENT)) name = advance()->sval;
+        if (name_out) *name_out = name;
+
+        /* optional array dimension(s) inside the parens: (*arr[N]) */
+        int arr_dims[8];
+        int ndims = 0;
+        while (check(TK_LBRACKET)) {
+            advance();
+            if (!check(TK_INT_LIT)) die("array size must be a literal integer");
+            arr_dims[ndims++] = (int)advance()->ival;
+            expect(TK_RBRACKET, "expected ']'");
+        }
+
+        expect(TK_RPAREN, "expected ')' in grouped declarator");
+
+        /* What follows determines the type:
+           (params)  -> function pointer (or array of fp if ndims > 0)
+           nothing   -> plain pointer (or array of ptr if ndims > 0)      */
+        struct Type *t;
+        if (check(TK_LPAREN)) {
+            /* function pointer: build TY_FUNC then wrap in ptr */
+            advance(); /* consume '(' of param list */
+            struct Type *ft = parse_fp_params(base, NULL);
+            /* wrap in pointer(s) */
+            t = ptr_to(ft);
+            for (int i = 1; i < inner_stars; i++) t = ptr_to(t);
+        } else {
+            /* plain grouped pointer, e.g. int (*p) or int (*p)[N] */
+            t = base;
+            for (int i = 0; i < inner_stars; i++) t = ptr_to(t);
+            /* trailing array brackets after the closing ')' */
+            while (check(TK_LBRACKET)) {
+                advance();
+                if (!check(TK_INT_LIT)) die("array size must be a literal integer");
+                int sz = (int)advance()->ival;
+                expect(TK_RBRACKET, "expected ']'");
+                t = array_of(t, sz);
+            }
+        }
+
+        /* wrap in array dimensions collected inside the parens (right-to-left) */
+        for (int i = ndims - 1; i >= 0; i--)
+            t = array_of(t, arr_dims[i]);
+
+        /* outer pointer stars (rare, e.g. int (**pp)(void)) */
+        for (int i = 0; i < stars; i++) t = ptr_to(t);
+
+        return t;
+    }
+
+    /* --- plain declarator: stars already counted --- */
     char *name = NULL;
     if (check(TK_IDENT)) name = advance()->sval;
     if (name_out) *name_out = name;
 
-    /* array brackets -- only literal integer size */
     struct Type *t = base;
     for (int i = 0; i < stars; i++) t = ptr_to(t);
 
-    /* wrap in void* if base was void and we have stars */
-    /* (handled above naturally) */
-
-    /* array brackets — support multiple dimensions */
+    /* array brackets */
     if (match(TK_LBRACKET)) {
         if (check(TK_RBRACKET)) {
-            /* int a[] in parameter -- decay to pointer */
             advance();
             t = ptr_to(t);
         } else {
@@ -818,7 +924,6 @@ static struct Type *parse_declarator(struct Type *base, char **name_out) {
                 die("array size must be a literal integer");
             int sz = (int)advance()->ival;
             expect(TK_RBRACKET, "expected ']'");
-            /* parse additional dimensions right-to-left so inner dim is base */
             while (match(TK_LBRACKET)) {
                 if (!check(TK_INT_LIT))
                     die("array size must be a literal integer");
@@ -915,10 +1020,12 @@ static struct Node *parse_postfix(void) {
             r->name = m->sval;
             n = r;
         } else if (check(TK_LPAREN)) {
-            /* function call */
+            /* function call: store both name (if ident) and callee node.
+               resolve_expr decides whether this is a direct or indirect call. */
             advance();
             struct Node *call = new_node(ND_CALL);
-            call->name = n->name; /* simple ident call */
+            call->callee = n;                                      /* always set */
+            call->name   = (n->kind == ND_IDENT) ? n->name : NULL; /* hint only */
             struct Node *arg_head = NULL, *arg_tail = NULL;
             int   argc = 0;
             while (!check(TK_RPAREN)) {
@@ -1328,13 +1435,30 @@ static void resolve_expr(struct Node *n) {
             resolve_expr(n->els);
             break;
         case ND_CALL: {
-            struct ProtoEntry *pe = find_proto(n->name);
-            if (!pe) die("call to undeclared function '%s'", n->name);
-            n->type = pe->ret_type;
-            /* for variadic functions accept any number of args >= arity */
-            if (!pe->is_variadic && pe->arity >= 0 && (int)n->ival != pe->arity)
-                die("wrong number of arguments to '%s' (expected %d, got %d)",
-                    n->name, pe->arity, (int)n->ival);
+            /* Decide direct vs indirect:
+               - If name matches a proto → direct call, clear callee
+               - Otherwise → indirect call through a variable/expression   */
+            if (n->name && find_proto(n->name)) {
+                /* direct call */
+                n->callee = NULL;
+                struct ProtoEntry *pe = find_proto(n->name);
+                n->type = pe->ret_type;
+                if (!pe->is_variadic && pe->arity >= 0 && (int)n->ival != pe->arity)
+                    die("wrong number of arguments to '%s' (expected %d, got %d)",
+                        n->name, pe->arity, (int)n->ival);
+            } else {
+                /* indirect call through function pointer variable/expression */
+                resolve_expr(n->callee);
+                struct Type *ct = n->callee->type;
+                /* unwrap: ptr-to-func */
+                if (ct && ct->kind == TY_PTR && ct->base && ct->base->kind == TY_FUNC)
+                    n->type = ct->base->ret;
+                else if (ct && ct->kind == TY_FUNC)
+                    n->type = ct->ret;
+                else if (n->name)
+                    die("call to undeclared function '%s'", n->name);
+                n->name = NULL; /* mark as indirect */
+            }
             for (struct Node *a = n->args; a; a = a->next) resolve_expr(a);
             break;
         }
@@ -1627,8 +1751,13 @@ static void gen_expr(struct Node *n) {
         }
         case ND_IDENT:
             gen_addr(n);
-            /* arrays decay to pointer (their address); scalars get loaded */
+            /* arrays and functions decay to their address — no load needed */
             if (n->type && n->type->kind == TY_ARRAY) {
+                return;
+            }
+            /* function name used as value (e.g. fp = add): rax already holds address */
+            if (!n->is_local && find_proto(n->name)) {
+                /* it's a function name — its address is the value */
                 return;
             }
             if (is_float_type(n->type)) {
@@ -2098,79 +2227,61 @@ static void gen_expr(struct Node *n) {
                - integer/pointer args: rdi, rsi, rdx, rcx, r8, r9
                - float/double args:    xmm0..xmm7
                - stack args: right-to-left
-               - for variadic: al = number of XMM registers used */
+               - for variadic: al = number of XMM registers used     */
             int int_arg_idx = 0;
             int xmm_arg_idx = 0;
 
-            /* count stack args: args beyond first 6 int + 8 xmm go on stack */
-            /* simplified: track separately */
+            /* classify args: which go to registers, which to stack */
+            bool is_stack[64] = {false};
             int stack_argc = 0;
             {
                 int ii = 0, xi = 0;
                 for (int i = 0; i < argc; i++) {
                     if (is_float_type(args[i]->type)) {
-                        if (xi < 8) xi++; else stack_argc++;
+                        if (xi < 8) xi++; else { is_stack[i] = true; stack_argc++; }
                     } else {
-                        if (ii < 6) ii++; else stack_argc++;
+                        if (ii < 6) ii++; else { is_stack[i] = true; stack_argc++; }
                     }
                 }
             }
 
-            int pad = (stack_argc % 2 != 0) ? 1 : 0;
+            /* Stack alignment: we will push stack_argc 8-byte args, then
+               (for indirect calls) 1 more 8-byte callee slot.
+               We need (total pushes) to be even for 16-byte alignment before call.
+               Add a pad slot if needed. */
+            int total_pushes = stack_argc + (n->callee ? 1 : 0);
+            int pad = (total_pushes % 2 != 0) ? 1 : 0;
             if (pad) emit("  subq $8, %%rsp");
 
             /* push stack args right-to-left */
-            {
-                int ii = 0, xi = 0;
-                for (int i = argc - 1; i >= 0; i--) {
-                    bool fa = is_float_type(args[i]->type);
-                    int goes_to_reg = fa ? (xi < 8) : (ii < 6);
-                    /* count in forward order first to know register indices */
-                    (void)goes_to_reg;
-                }
-                /* recount forward to find which go to stack */
-                int fwd_ii = 0, fwd_xi = 0;
-                bool is_stack[64] = {false};
-                for (int i = 0; i < argc; i++) {
-                    if (is_float_type(args[i]->type)) {
-                        if (fwd_xi < 8) fwd_xi++; else is_stack[i] = true;
+            for (int i = argc - 1; i >= 0; i--) {
+                if (!is_stack[i]) continue;
+                gen_expr(args[i]);
+                if (is_float_type(args[i]->type)) {
+                    emit("  subq $8, %%rsp");
+                    if (args[i]->type->kind == TY_FLOAT) {
+                        emit("  cvtss2sd %%xmm0, %%xmm0");
+                        emit("  movsd %%xmm0, (%%rsp)");
                     } else {
-                        if (fwd_ii < 6) fwd_ii++; else is_stack[i] = true;
+                        emit("  movsd %%xmm0, (%%rsp)");
                     }
-                }
-                for (int i = argc - 1; i >= 0; i--) {
-                    if (!is_stack[i]) continue;
-                    gen_expr(args[i]);
-                    if (is_float_type(args[i]->type)) {
-                        emit("  subq $8, %%rsp");
-                        if (args[i]->type->kind == TY_FLOAT) {
-                            /* widen float to double for stack pass (System V) */
-                            emit("  cvtss2sd %%xmm0, %%xmm0");
-                            emit("  movsd %%xmm0, (%%rsp)");
-                        } else {
-                            emit("  movsd %%xmm0, (%%rsp)");
-                        }
-                    } else {
-                        emit("  pushq %%rax");
-                    }
+                } else {
+                    emit("  pushq %%rax");
                 }
             }
 
-            /* evaluate register args and temporarily spill all to stack,
-               then load into the proper registers */
-            /* Spill integer reg args first (right-to-left), then XMM (right-to-left) */
+            /* For indirect calls: evaluate the callee pointer NOW (after stack
+               args, before register args), and push it. It sits on top of the
+               stack args. We will pop it into %r11 just before the call.
+               %r11 is caller-saved and never used as an argument register. */
+            if (n->callee) {
+                gen_expr(n->callee);
+                emit("  pushq %%rax");
+            }
+
+            /* evaluate register args right-to-left, spill to stack temporarily */
             {
-                int fwd_ii = 0, fwd_xi = 0;
-                bool is_stack[64] = {false};
-                for (int i = 0; i < argc; i++) {
-                    if (is_float_type(args[i]->type)) {
-                        if (fwd_xi < 8) fwd_xi++; else is_stack[i] = true;
-                    } else {
-                        if (fwd_ii < 6) fwd_ii++; else is_stack[i] = true;
-                    }
-                }
                 int_arg_idx = 0; xmm_arg_idx = 0;
-                /* evaluate and push all register args right-to-left as 8-byte slots */
                 for (int i = argc - 1; i >= 0; i--) {
                     if (is_stack[i]) continue;
                     gen_expr(args[i]);
@@ -2184,7 +2295,7 @@ static void gen_expr(struct Node *n) {
                         emit("  pushq %%rax");
                     }
                 }
-                /* pop into registers in forward order */
+                /* reload into registers in forward order */
                 for (int i = 0; i < argc; i++) {
                     if (is_stack[i]) continue;
                     if (is_float_type(args[i]->type)) {
@@ -2201,20 +2312,31 @@ static void gen_expr(struct Node *n) {
                 }
             }
 
-            /* for variadic: al = number of XMM args */
-            struct ProtoEntry *pe = find_proto(n->name);
+            /* determine variadic */
+            struct ProtoEntry *pe = n->name ? find_proto(n->name) : NULL;
             bool is_var = pe && pe->is_variadic;
-            if (is_var)
-                emit("  movb $%d, %%al", xmm_arg_idx);
-            else
-                emit("  xorq %%rax, %%rax");
-            emit("  callq %s", n->name);
+            if (!is_var && n->callee) {
+                struct Type *ct = n->callee->type;
+                if (ct && ct->kind == TY_PTR && ct->base && ct->base->kind == TY_FUNC)
+                    is_var = ct->base->func_variadic;
+            }
 
-            /* clean up stack args + padding */
+            if (n->callee) {
+                /* pop the callee pointer (now on top) into r11, then call */
+                emit("  popq %%r11");
+                if (is_var) emit("  movb $%d, %%al", xmm_arg_idx);
+                else        emit("  xorq %%rax, %%rax");
+                emit("  callq *%%r11");
+            } else {
+                if (is_var) emit("  movb $%d, %%al", xmm_arg_idx);
+                else        emit("  xorq %%rax, %%rax");
+                emit("  callq %s", n->name);
+            }
+
+            /* clean up stack args + padding (callee slot already popped via r11) */
             int cleanup = (stack_argc + pad) * 8;
             if (cleanup) emit("  addq $%d, %%rsp", cleanup);
 
-            /* float return: xmm0 already has the result; int return: rax */
             return;
         }
         case ND_MEMBER:
