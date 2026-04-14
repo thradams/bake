@@ -1,5 +1,7 @@
 # Cake Backend
 
+Vibe coding backend.
+
 ```c
 
 gcc bake.c -o bake
