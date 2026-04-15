@@ -1417,12 +1417,18 @@ static void resolve_expr(struct Node *n) {
         case ND_BINARY:
             resolve_expr(n->lhs);
             resolve_expr(n->rhs);
-            /* result type: if ptr+int or ptr-int, keep pointer type */
-            if (n->lhs->type && (n->lhs->type->kind == TY_PTR || n->lhs->type->kind == TY_ARRAY)
-                && (n->op == TK_PLUS || n->op == TK_MINUS))
-                n->type = n->lhs->type;
-            else
-                n->type = n->lhs->type;  /* default: lhs type */
+            {
+                bool lp = n->lhs->type && (n->lhs->type->kind == TY_PTR || n->lhs->type->kind == TY_ARRAY);
+                bool rp = n->rhs->type && (n->rhs->type->kind == TY_PTR || n->rhs->type->kind == TY_ARRAY);
+                if (lp && rp && n->op == TK_MINUS)
+                    n->type = ty_long;          /* ptr - ptr -> ptrdiff_t */
+                else if (lp && (n->op == TK_PLUS || n->op == TK_MINUS))
+                    n->type = n->lhs->type;     /* ptr +/- int -> ptr */
+                else if (rp && n->op == TK_PLUS)
+                    n->type = n->rhs->type;     /* int + ptr -> ptr */
+                else
+                    n->type = n->lhs->type;     /* default: lhs type */
+            }
             break;
         case ND_ASSIGN:
             resolve_expr(n->lhs);
@@ -2017,19 +2023,51 @@ static void gen_expr(struct Node *n) {
             }
 
             /* integer arithmetic (original path) */
-            /* detect pointer arithmetic: ptr +/- int needs scaling */
+            /* detect pointer arithmetic */
             bool lhs_is_ptr = n->lhs->type &&
                               (n->lhs->type->kind == TY_PTR ||
                                n->lhs->type->kind == TY_ARRAY);
             bool rhs_is_ptr = n->rhs->type &&
                               (n->rhs->type->kind == TY_PTR ||
                                n->rhs->type->kind == TY_ARRAY);
+
+            /* ptr - ptr: subtract bytes then divide by element size */
+            if (n->op == TK_MINUS && lhs_is_ptr && rhs_is_ptr) {
+                int esz = 1;
+                struct Type *base = n->lhs->type->base;
+                if (base) esz = type_size(base);
+                gen_expr(n->rhs);
+                emit("  pushq %%rax");
+                gen_expr(n->lhs);
+                emit("  popq %%rcx");
+                emit("  subq %%rcx, %%rax");   /* byte difference in rax */
+                if (esz > 1) {
+                    emit("  movq $%d, %%rcx", esz);
+                    emit("  cqto");
+                    emit("  idivq %%rcx");       /* rax = byte_diff / esz */
+                }
+                return;
+            }
+
+            /* ptr +/- int: scale the integer by element size */
             int ptr_scale = 1;
             if ((n->op == TK_PLUS || n->op == TK_MINUS) && lhs_is_ptr && !rhs_is_ptr) {
                 struct Type *base = n->lhs->type->base;
                 if (base) ptr_scale = type_size(base);
             }
-            (void)rhs_is_ptr;
+            /* int + ptr: commute so pointer is on lhs */
+            if (n->op == TK_PLUS && !lhs_is_ptr && rhs_is_ptr) {
+                struct Type *base = n->rhs->type->base;
+                if (base) ptr_scale = type_size(base);
+                /* evaluate lhs (int), scale it, then add rhs (ptr) */
+                gen_expr(n->lhs);
+                if (ptr_scale > 1) emit("  imulq $%d, %%rax", ptr_scale);
+                emit("  pushq %%rax");
+                gen_expr(n->rhs);
+                emit("  popq %%rcx");
+                emit("  addq %%rcx, %%rax");
+                return;
+            }
 
             gen_expr(n->rhs);
             if (ptr_scale > 1) emit("  imulq $%d, %%rax", ptr_scale);
