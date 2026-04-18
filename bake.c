@@ -570,6 +570,7 @@ struct Node {
     bool     is_variadic; /* for ND_FUNC: has ... parameter */
     bool     is_float;    /* for ND_FLOAT: true=float, false=double */
     int      offset;  /* stack offset for locals (negative from rbp) */
+    int      sret_offset; /* rbp offset for hidden sret pointer (ND_FUNC only) */
 };
 
 static struct Node *new_node(enum NodeKind k) {
@@ -1550,9 +1551,22 @@ static void resolve_stmt(struct Node *n) {
     }
 }
 
+/* forward declarations for struct-return helpers (defined in codegen section) */
+static bool is_struct_type(struct Type *t);
+static bool struct_fits_regs(struct Type *t);
+static bool struct_needs_sret(struct Type *t);
+
 static void resolve_func(struct Node *fn) {
     push_scope();
     local_offset = 0;
+
+    /* sret: reserve a stack slot for the hidden pointer if returning large struct */
+    if (struct_needs_sret(fn->type)) {
+        local_offset += 8;
+        fn->sret_offset = -local_offset;
+    } else {
+        fn->sret_offset = 0;
+    }
 
     /* add parameters to scope */
     int arg_regs_used = 0;
@@ -1596,9 +1610,11 @@ static void emit_string_literal(const char *s) {
     }
     fprintf(out, "\"\n");
 }
-static char *current_func_end;  /* label for return */
-static char *break_label;
-static char *continue_label;
+static char      *current_func_end;        /* label for return */
+static char      *break_label;
+static char      *continue_label;
+static struct Type *current_func_ret_type; /* return type of current function */
+static int        current_func_sret_offset;/* rbp offset of hidden sret pointer (large structs) */
 
 /* System V AMD64: integer args in rdi, rsi, rdx, rcx, r8, r9 */
 static const char *arg_regs[] = {
@@ -1632,6 +1648,48 @@ static void emit(const char *fmt, ...) {
     vfprintf(out, fmt, ap);
     fprintf(out, "\n");
     va_end(ap);
+}
+
+/* ------------------------------------------------------------------ */
+/* Struct return classification (System V AMD64 ABI)                   */
+/* Structs <= 16 bytes are returned in rax[:rdx] (integer eightbytes). */
+/* Larger structs use a hidden pointer in rdi (sret convention).        */
+/* ------------------------------------------------------------------ */
+
+static bool is_struct_type(struct Type *t) {
+    return t && (t->kind == TY_STRUCT || t->kind == TY_UNION);
+}
+
+static bool struct_fits_regs(struct Type *t) {
+    return is_struct_type(t) && type_size(t) <= 16;
+}
+
+static bool struct_needs_sret(struct Type *t) {
+    return is_struct_type(t) && type_size(t) > 16;
+}
+
+/* Inline memcpy: copy `bytes` bytes from [src_reg] to [dst_reg]. Clobbers rcx. */
+static void emit_memcpy(const char *dst_reg, const char *src_reg, int bytes) {
+    int off = 0;
+    while (bytes - off >= 8) {
+        emit("  movq  %d(%%%s), %%rcx", off, src_reg);
+        emit("  movq  %%rcx, %d(%%%s)", off, dst_reg);
+        off += 8;
+    }
+    if (bytes - off >= 4) {
+        emit("  movl  %d(%%%s), %%ecx", off, src_reg);
+        emit("  movl  %%ecx, %d(%%%s)", off, dst_reg);
+        off += 4;
+    }
+    if (bytes - off >= 2) {
+        emit("  movw  %d(%%%s), %%cx", off, src_reg);
+        emit("  movw  %%cx, %d(%%%s)", off, dst_reg);
+        off += 2;
+    }
+    if (bytes - off >= 1) {
+        emit("  movb  %d(%%%s), %%cl", off, src_reg);
+        emit("  movb  %%cl, %d(%%%s)", off, dst_reg);
+    }
 }
 
 /* size suffix for AT&T asm */
@@ -1715,6 +1773,12 @@ static void gen_addr(struct Node *n) {
             break;
         }
         default:
+            /* If the expression is a struct-returning call, gen_expr leaves
+               rax pointing to the result buffer — that is already an address. */
+            if (n->kind == ND_CALL && is_struct_type(n->type)) {
+                gen_expr(n);
+                return;
+            }
             die("cannot take address of expression");
     }
 }
@@ -1759,6 +1823,10 @@ static void gen_expr(struct Node *n) {
             gen_addr(n);
             /* arrays and functions decay to their address — no load needed */
             if (n->type && n->type->kind == TY_ARRAY) {
+                return;
+            }
+            /* structs: leave rax = address (caller uses gen_addr for struct access) */
+            if (is_struct_type(n->type)) {
                 return;
             }
             /* function name used as value (e.g. fp = add): rax already holds address */
@@ -2127,6 +2195,26 @@ static void gen_expr(struct Node *n) {
             return;
         }
         case ND_ASSIGN: {
+            /* Struct assignment: s1 = s2  (only plain TK_ASSIGN makes sense) */
+            if (is_struct_type(n->lhs->type)) {
+                int sz = type_size(n->lhs->type);
+                bool rhs_is_call = (n->rhs->kind == ND_CALL);
+                if (rhs_is_call) {
+                    gen_expr(n->rhs);          /* rax = pointer to temp result */
+                    emit("  movq %%rax, %%rsi");
+                } else {
+                    gen_addr(n->rhs);
+                    emit("  movq %%rax, %%rsi");
+                }
+                gen_addr(n->lhs);              /* rax = destination address */
+                emit("  movq %%rax, %%rdi");
+                emit_memcpy("rdi", "rsi", sz);
+                emit("  movq %%rdi, %%rax");   /* return lhs address as value */
+                if (rhs_is_call && n->rhs->ival > 0) {
+                    emit("  addq $%lld, %%rsp", n->rhs->ival);
+                }
+                return;
+            }
             bool lhs_float = is_float_type(n->lhs->type);
             if (lhs_float) {
                 bool is_d = (n->lhs->type->kind == TY_DOUBLE);
@@ -2262,95 +2350,178 @@ static void gen_expr(struct Node *n) {
             }
 
             /* System V AMD64 ABI:
-               - integer/pointer args: rdi, rsi, rdx, rcx, r8, r9
-               - float/double args:    xmm0..xmm7
-               - stack args: right-to-left
-               - for variadic: al = number of XMM registers used     */
+               Stack layout (low addr = top of stack):
+                 [large-struct arg copies]  <- allocated FIRST (safe from callee frame)
+                 [sret return buffer]       <- r10 points here (if call_sret)
+                 [stack args + pad]
+                 [return address]           <- callq pushes this
+            */
             int int_arg_idx = 0;
             int xmm_arg_idx = 0;
 
-            /* classify args: which go to registers, which to stack */
+            struct Type *call_ret = n->type;
+            bool call_sret = struct_needs_sret(call_ret);
+            bool call_sreg = struct_fits_regs(call_ret);
+
+            /* --- classify args --- */
             bool is_stack[64] = {false};
-            int stack_argc = 0;
+            int  stack_argc   = 0;
             {
-                int ii = 0, xi = 0;
+                int ii = call_sret ? 1 : 0;
+                int xi = 0;
                 for (int i = 0; i < argc; i++) {
-                    if (is_float_type(args[i]->type)) {
-                        if (xi < 8) xi++; else { is_stack[i] = true; stack_argc++; }
+                    struct Type *at = args[i]->type;
+                    if (is_float_type(at)) {
+                        if (xi < 8) xi++;
+                        else { is_stack[i] = true; stack_argc++; }
+                    } else if (struct_fits_regs(at)) {
+                        int nregs = (type_size(at) + 7) / 8;
+                        if (ii + nregs <= 6) ii += nregs;
+                        else { is_stack[i] = true; stack_argc += nregs; }
+                    } else if (struct_needs_sret(at)) {
+                        if (ii < 6) ii++;
+                        else { is_stack[i] = true; stack_argc++; }
                     } else {
-                        if (ii < 6) ii++; else { is_stack[i] = true; stack_argc++; }
+                        if (ii < 6) ii++;
+                        else { is_stack[i] = true; stack_argc++; }
                     }
                 }
             }
 
-            /* Stack alignment: we will push stack_argc 8-byte args, then
-               (for indirect calls) 1 more 8-byte callee slot.
-               We need (total pushes) to be even for 16-byte alignment before call.
-               Add a pad slot if needed. */
+            /* --- Step 1: allocate large-struct arg copies ABOVE sret buffer ---
+               Pre-compute total, allocate once, fill each copy.
+               These sit in caller stack space; the callee cannot overwrite them. */
+            int lsarg_offsets[64];
+            memset(lsarg_offsets, 0, sizeof(lsarg_offsets));
+            int lsarg_total = 0;
+            for (int i = 0; i < argc; i++) {
+                if (!is_stack[i] && struct_needs_sret(args[i]->type)) {
+                    lsarg_offsets[i] = lsarg_total;
+                    lsarg_total += (type_size(args[i]->type) + 15) & ~15;
+                }
+            }
+            if (lsarg_total) {
+                emit("  subq $%d, %%rsp", lsarg_total);
+                emit("  movq %%rsp, %%r10"); /* temp base; overwritten by sret below */
+                for (int i = 0; i < argc; i++) {
+                    if (is_stack[i] || !struct_needs_sret(args[i]->type)) continue;
+                    int sz = type_size(args[i]->type);
+                    gen_addr(args[i]);
+                    emit("  movq  %%rax, %%rsi");
+                    emit("  leaq  %d(%%r10), %%rdi", lsarg_offsets[i]);
+                    emit_memcpy("rdi", "rsi", sz);
+                }
+            }
+
+            /* --- Step 2: allocate sret return buffer below copies --- */
+            int sret_sz_aligned = call_sret ? ((type_size(call_ret) + 15) & ~15) : 0;
+            if (call_sret) {
+                emit("  subq $%d, %%rsp", sret_sz_aligned);
+                emit("  movq %%rsp, %%r10");
+            }
+
+            /* --- Step 3: alignment pad + stack args (right-to-left) --- */
             int total_pushes = stack_argc + (n->callee ? 1 : 0);
             int pad = (total_pushes % 2 != 0) ? 1 : 0;
             if (pad) emit("  subq $8, %%rsp");
 
-            /* push stack args right-to-left */
             for (int i = argc - 1; i >= 0; i--) {
                 if (!is_stack[i]) continue;
-                gen_expr(args[i]);
-                if (is_float_type(args[i]->type)) {
+                struct Type *at = args[i]->type;
+                if (is_float_type(at)) {
+                    gen_expr(args[i]);
                     emit("  subq $8, %%rsp");
-                    if (args[i]->type->kind == TY_FLOAT) {
+                    if (at->kind == TY_FLOAT) {
                         emit("  cvtss2sd %%xmm0, %%xmm0");
                         emit("  movsd %%xmm0, (%%rsp)");
                     } else {
                         emit("  movsd %%xmm0, (%%rsp)");
                     }
+                } else if (struct_fits_regs(at)) {
+                    int sz = type_size(at);
+                    gen_addr(args[i]);
+                    emit("  movq  %%rax, %%rcx");
+                    if (sz > 8) { emit("  movq  8(%%rcx), %%rax"); emit("  pushq %%rax"); }
+                    emit("  movq  (%%rcx), %%rax");
+                    emit("  pushq %%rax");
                 } else {
+                    gen_expr(args[i]);
                     emit("  pushq %%rax");
                 }
             }
 
-            /* For indirect calls: evaluate the callee pointer NOW (after stack
-               args, before register args), and push it. It sits on top of the
-               stack args. We will pop it into %r11 just before the call.
-               %r11 is caller-saved and never used as an argument register. */
+            /* --- Step 4: indirect callee ptr --- */
             if (n->callee) {
                 gen_expr(n->callee);
                 emit("  pushq %%rax");
             }
 
-            /* evaluate register args right-to-left, spill to stack temporarily */
+            /* --- Step 5: register args (right-to-left spill, forward reload) --- */
             {
-                int_arg_idx = 0; xmm_arg_idx = 0;
+                int_arg_idx = call_sret ? 1 : 0;
+                xmm_arg_idx = 0;
+                /* Track bytes pushed so far in this loop so that the leaq offset
+                   for large-struct arg pointers stays correct as rsp moves. */
+                int spilled_so_far = 0;
                 for (int i = argc - 1; i >= 0; i--) {
                     if (is_stack[i]) continue;
-                    gen_expr(args[i]);
-                    if (is_float_type(args[i]->type)) {
+                    struct Type *at = args[i]->type;
+                    if (is_float_type(at)) {
+                        gen_expr(args[i]);
                         emit("  subq $8, %%rsp");
-                        if (args[i]->type->kind == TY_FLOAT)
-                            emit("  movss %%xmm0, (%%rsp)");
-                        else
-                            emit("  movsd %%xmm0, (%%rsp)");
-                    } else {
+                        if (at->kind == TY_FLOAT) emit("  movss %%xmm0, (%%rsp)");
+                        else                      emit("  movsd %%xmm0, (%%rsp)");
+                        spilled_so_far += 8;
+                    } else if (struct_fits_regs(at)) {
+                        int sz = type_size(at);
+                        gen_addr(args[i]);
+                        emit("  movq  %%rax, %%rcx");
+                        emit("  movq  (%%rcx), %%rax"); emit("  pushq %%rax");
+                        spilled_so_far += 8;
+                        if (sz > 8) {
+                            emit("  movq  8(%%rcx), %%rax"); emit("  pushq %%rax");
+                            spilled_so_far += 8;
+                        }
+                    } else if (struct_needs_sret(at)) {
+                        /* Address of pre-filled copy relative to *current* rsp.
+                           block base = rsp + spilled_so_far + (stack_argc+pad)*8
+                                            + sret_sz_aligned
+                           copy i starts at block_base + lsarg_offsets[i] */
+                        int block_base_from_rsp = spilled_so_far
+                                                  + (stack_argc + pad) * 8
+                                                  + sret_sz_aligned;
+                        emit("  leaq  %d(%%rsp), %%rax",
+                             block_base_from_rsp + lsarg_offsets[i]);
                         emit("  pushq %%rax");
+                        spilled_so_far += 8;
+                    } else {
+                        gen_expr(args[i]);
+                        emit("  pushq %%rax");
+                        spilled_so_far += 8;
                     }
                 }
-                /* reload into registers in forward order */
                 for (int i = 0; i < argc; i++) {
                     if (is_stack[i]) continue;
-                    if (is_float_type(args[i]->type)) {
-                        if (args[i]->type->kind == TY_FLOAT)
-                            emit("  movss (%%rsp), %%xmm%d", xmm_arg_idx);
-                        else
-                            emit("  movsd (%%rsp), %%xmm%d", xmm_arg_idx);
+                    struct Type *at = args[i]->type;
+                    if (is_float_type(at)) {
+                        if (at->kind == TY_FLOAT) emit("  movss (%%rsp), %%xmm%d", xmm_arg_idx);
+                        else                      emit("  movsd (%%rsp), %%xmm%d", xmm_arg_idx);
                         emit("  addq $8, %%rsp");
                         xmm_arg_idx++;
+                    } else if (struct_fits_regs(at)) {
+                        int sz = type_size(at);
+                        emit("  popq %%%s", arg_regs[int_arg_idx++]);
+                        if (sz > 8) emit("  popq %%%s", arg_regs[int_arg_idx++]);
                     } else {
-                        emit("  popq %%%s", arg_regs[int_arg_idx]);
-                        int_arg_idx++;
+                        emit("  popq %%%s", arg_regs[int_arg_idx++]);
                     }
                 }
             }
 
-            /* determine variadic */
+            /* --- Step 6: set sret ptr --- */
+            if (call_sret) emit("  movq %%r10, %%rdi");
+
+            /* --- Step 7: call --- */
             struct ProtoEntry *pe = n->name ? find_proto(n->name) : NULL;
             bool is_var = pe && pe->is_variadic;
             if (!is_var && n->callee) {
@@ -2358,9 +2529,7 @@ static void gen_expr(struct Node *n) {
                 if (ct && ct->kind == TY_PTR && ct->base && ct->base->kind == TY_FUNC)
                     is_var = ct->base->func_variadic;
             }
-
             if (n->callee) {
-                /* pop the callee pointer (now on top) into r11, then call */
                 emit("  popq %%r11");
                 if (is_var) emit("  movb $%d, %%al", xmm_arg_idx);
                 else        emit("  xorq %%rax, %%rax");
@@ -2371,9 +2540,32 @@ static void gen_expr(struct Node *n) {
                 emit("  callq %s", n->name);
             }
 
-            /* clean up stack args + padding (callee slot already popped via r11) */
-            int cleanup = (stack_argc + pad) * 8;
-            if (cleanup) emit("  addq $%d, %%rsp", cleanup);
+            /* --- Step 8: cleanup stack args + pad ---
+               Large-struct copies and sret buffer are consumed by ND_DECL/ND_ASSIGN. */
+            {
+                int cleanup = (stack_argc + pad) * 8;
+                if (cleanup) emit("  addq $%d, %%rsp", cleanup);
+            }
+
+            /* --- Step 9: struct result ---
+               sret : rax = r10 (sret buffer on stack, above lsarg copies).
+                      ND_DECL frees sret_sz_aligned + lsarg_total bytes.
+               sreg : unpack rax:rdx into a 16-byte stack slot; rax = ptr.
+                      ND_DECL frees 16 bytes.
+               Store total bytes to reclaim in n->ival for consumers (ND_DECL/ND_ASSIGN). */
+            if (call_sret) {
+                /* nothing: rax already points to sret buffer */
+                n->ival = sret_sz_aligned + lsarg_total;
+            } else if (call_sreg) {
+                int sz = type_size(call_ret);
+                emit("  subq $16, %%rsp");
+                emit("  movq %%rax, (%%rsp)");
+                if (sz > 8) emit("  movq %%rdx, 8(%%rsp)");
+                emit("  movq %%rsp, %%rax");
+                n->ival = 16;
+            } else {
+                n->ival = 0;
+            }
 
             return;
         }
@@ -2528,16 +2720,67 @@ static void gen_stmt(struct Node *n) {
             return;
         case ND_DECL:
             if (n->init) {
-                gen_expr(n->init);
-                int sz = n->type ? type_size(n->type) : 8;
-                if      (sz == 8) emit("  movq  %%rax, %d(%%rbp)", n->offset);
-                else if (sz == 4) emit("  movl  %%eax, %d(%%rbp)", n->offset);
-                else if (sz == 2) emit("  movw  %%ax,  %d(%%rbp)", n->offset);
-                else              emit("  movb  %%al,  %d(%%rbp)", n->offset);
+                if (is_struct_type(n->type)) {
+                    /* The initialiser must be a struct-returning call (or another
+                       struct lvalue). gen_expr / gen_addr leaves rax = pointer
+                       to source struct. We then memcpy into the local slot. */
+                    int sz = type_size(n->type);
+                    bool init_is_call = (n->init->kind == ND_CALL);
+                    if (init_is_call) {
+                        /* gen_expr for the call leaves rax = pointer to temp buf */
+                        gen_expr(n->init);
+                        emit("  movq  %%rax, %%rsi");   /* source */
+                    } else {
+                        gen_addr(n->init);
+                        emit("  movq  %%rax, %%rsi");
+                    }
+                    emit("  leaq  %d(%%rbp), %%rdi", n->offset);
+                    emit_memcpy("rdi", "rsi", sz);
+                    /* pop the temp buffer that gen_expr(ND_CALL) left on the stack */
+                    if (init_is_call && n->init->ival > 0) {
+                        emit("  addq $%lld, %%rsp", n->init->ival);
+                    }
+                } else {
+                    gen_expr(n->init);
+                    int sz = n->type ? type_size(n->type) : 8;
+                    if (is_float_type(n->type)) {
+                        if (n->type->kind == TY_FLOAT)
+                            emit("  movss %%xmm0, %d(%%rbp)", n->offset);
+                        else
+                            emit("  movsd %%xmm0, %d(%%rbp)", n->offset);
+                    } else if (sz == 8)
+                        emit("  movq  %%rax, %d(%%rbp)", n->offset);
+                    else if (sz == 4)
+                        emit("  movl  %%eax, %d(%%rbp)", n->offset);
+                    else if (sz == 2)
+                        emit("  movw  %%ax,  %d(%%rbp)", n->offset);
+                    else
+                        emit("  movb  %%al,  %d(%%rbp)", n->offset);
+                }
             }
             return;
         case ND_RETURN:
-            if (n->lhs) gen_expr(n->lhs);
+            if (n->lhs) {
+                struct Type *rt = current_func_ret_type;
+                if (struct_needs_sret(rt)) {
+                    /* large struct: copy return value into the hidden pointer */
+                    int sz = type_size(rt);
+                    gen_addr(n->lhs);
+                    emit("  movq  %%rax, %%rsi");          /* source address */
+                    emit("  movq  %d(%%rbp), %%rdi", current_func_sret_offset);
+                    emit_memcpy("rdi", "rsi", sz);
+                } else if (struct_fits_regs(rt)) {
+                    /* small struct: load up to 16 bytes into rax[:rdx] */
+                    int sz = type_size(rt);
+                    gen_addr(n->lhs);                       /* rax = source addr */
+                    emit("  movq  %%rax, %%rcx");           /* rcx = addr */
+                    emit("  movq  (%%rcx), %%rax");         /* low 8 bytes */
+                    if (sz > 8)
+                        emit("  movq  8(%%rcx), %%rdx");    /* high bytes */
+                } else {
+                    gen_expr(n->lhs);
+                }
+            }
             emit("  jmp %s", current_func_end);
             return;
         case ND_IF: {
@@ -2639,7 +2882,9 @@ static void gen_stmt(struct Node *n) {
 static void gen_func(struct Node *fn) {
     char end_label[64];
     sprintf(end_label, ".Lret_%s", fn->name);
-    current_func_end = arena_strdup(end_label);
+    current_func_end        = arena_strdup(end_label);
+    current_func_ret_type   = fn->type;   /* fn->type holds the return type */
+    current_func_sret_offset = 0;
 
     emit("  .text");
     emit("  .globl %s", fn->name);
@@ -2654,6 +2899,20 @@ static void gen_func(struct Node *fn) {
 
     /* move register args to stack slots */
     int int_idx = 0, xmm_idx = 0;
+
+    /* sret: if returning a large struct, the hidden pointer arrives in rdi
+       (the first integer register). Spill it to a dedicated stack slot so we
+       can always find it at epilogue time. resolve_func already reserved space
+       for it (it is recorded as a synthetic param at the front of the list
+       -- but we handle it here manually to keep the resolver simple). */
+    if (struct_needs_sret(fn->type)) {
+        /* The hidden slot offset was stored in current_func_sret_offset by
+           resolve_func. We just need to spill rdi now. */
+        current_func_sret_offset = fn->sret_offset;
+        emit("  movq  %%rdi, %d(%%rbp)", current_func_sret_offset);
+        int_idx = 1;   /* regular params start at rsi */
+    }
+
     for (struct Node *p = fn->params; p; p = p->next) {
         if (is_float_type(p->type)) {
             if (xmm_idx >= 8) break;
@@ -2662,6 +2921,29 @@ static void gen_func(struct Node *fn) {
             else
                 emit("  movsd %%xmm%d, %d(%%rbp)", xmm_idx, p->offset);
             xmm_idx++;
+        } else if (struct_fits_regs(p->type)) {
+            /* small struct: arrives in 1 or 2 integer registers, spill each eightbyte */
+            int sz = type_size(p->type);
+            if (int_idx >= 6) break;
+            emit("  movq  %%%s, %d(%%rbp)", arg_regs[int_idx], p->offset);
+            int_idx++;
+            if (sz > 8) {
+                if (int_idx >= 6) break;
+                emit("  movq  %%%s, %d(%%rbp)", arg_regs[int_idx], p->offset + 8);
+                int_idx++;
+            }
+        } else if (struct_needs_sret(p->type)) {
+            /* large struct: arrives as a pointer to a caller-allocated copy.
+               Spill the pointer into a temporary, then memcpy into our local slot. */
+            if (int_idx >= 6) break;
+            int sz = type_size(p->type);
+            /* use r11 as scratch to hold the incoming pointer */
+            emit("  movq  %%%s, %%r11", arg_regs[int_idx]);
+            int_idx++;
+            /* destination = our local stack slot */
+            emit("  leaq  %d(%%rbp), %%rdi", p->offset);
+            emit("  movq  %%r11, %%rsi");
+            emit_memcpy("rdi", "rsi", sz);
         } else {
             if (int_idx >= 6) break;
             int sz = p->type ? type_size(p->type) : 8;
@@ -2681,6 +2963,10 @@ static void gen_func(struct Node *fn) {
 
     /* epilogue */
     emit("%s:", current_func_end);
+    /* For large-struct sret: reload the hidden pointer into rax (ABI requires it) */
+    if (struct_needs_sret(fn->type)) {
+        emit("  movq  %d(%%rbp), %%rax", current_func_sret_offset);
+    }
     emit("  movq %%rbp, %%rsp");
     emit("  popq %%rbp");
     emit("  ret");
