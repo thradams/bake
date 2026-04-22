@@ -43,8 +43,31 @@ int line_number = 0;
 int if_depth = 0;
 int if_stack[MAX_INCLUDE_DEPTH];
 
-// Forward declaration
+// Forward declarations
 int parse_imm(const char *s, int32_t *val);
+int is_number(const char *s);
+int get_symbol(const char *name);
+void emit_byte(uint8_t b);
+void emit_word(uint16_t w);
+void emit_dword(uint32_t d);
+void emit_qword(uint64_t q);
+void add_reloc(uint32_t offset, const char *symbol, int type);
+int parse_reg(const char *s);
+int get_reg_size(const char *s);
+int is_64bit_reg(const char *s);
+int needs_rex(const char *reg);
+void emit_rex(int w, int r, int x, int b);
+void emit_rex_w(int r, int x, int b);
+int parse_mem_operand(const char *s, MemOperand *mem);
+void emit_modrm(uint8_t mod, uint8_t reg, uint8_t rm);
+void emit_sib(uint8_t scale, uint8_t index, uint8_t base);
+void emit_mem_operand(MemOperand *mem, uint8_t reg_opcode);
+void assemble_line(char *line);
+void resolve_relocs(void);
+void write_elf(const char *filename);
+void write_obj(const char *filename);
+static uint32_t elf_text_va(void);
+static uint32_t elf_data_va(void);
 
 int get_symbol(const char *name) {
     for (int i = 0; i < sym_count; i++)
@@ -107,8 +130,13 @@ void emit_qword(uint64_t q) {
 
 void add_reloc(uint32_t offset, const char *symbol, int type) {
     if (reloc_count < MAX_RELOCS) {
-        relocs[reloc_count].offset = offset + (current_section == 0 ? code_size : data_size);
-        strcpy(relocs[reloc_count].symbol, symbol);
+        /* 'offset' is unused legacy parameter — the reloc always patches
+           the dword at the current emit position (code_size or data_size). */
+        (void)offset;
+        relocs[reloc_count].offset = (current_section == 0 ? code_size : data_size);
+        strncpy(relocs[reloc_count].symbol, symbol,
+                sizeof(relocs[reloc_count].symbol) - 1);
+        relocs[reloc_count].symbol[sizeof(relocs[reloc_count].symbol)-1] = '\0';
         relocs[reloc_count].type = type | (current_section << 8);
         reloc_count++;
     }
@@ -261,11 +289,17 @@ int parse_mem_operand(const char *s, MemOperand *mem) {
                     if (mem->base_reg == -1) mem->base_reg = reg;
                     else mem->index_reg = reg;
                 } else {
+                    /* Use parse_imm only for pure numeric literals.
+                       Symbol names (labels) must become disp_symbol so
+                       they are resolved via reloc — even if the symbol is
+                       already defined with a tagged value like 0x80000000. */
                     int32_t val;
-                    if (parse_imm(buf, &val)) {
+                    if (is_number(buf) && parse_imm(buf, &val)) {
                         mem->disp = val;
                     } else {
-                        strcpy(mem->disp_symbol, buf);
+                        strncpy(mem->disp_symbol, buf,
+                                sizeof(mem->disp_symbol) - 1);
+                        mem->disp_symbol[sizeof(mem->disp_symbol)-1] = '\0';
                         mem->has_disp_symbol = 1;
                     }
                 }
@@ -279,7 +313,7 @@ int parse_mem_operand(const char *s, MemOperand *mem) {
                 i = 0;
             }
         } else {
-            buf[i++] = *s;
+            if (i < 63) buf[i++] = *s;
         }
         s++;
     }
@@ -292,10 +326,12 @@ int parse_mem_operand(const char *s, MemOperand *mem) {
             else mem->index_reg = reg;
         } else {
             int32_t val;
-            if (parse_imm(buf, &val)) {
+            if (is_number(buf) && parse_imm(buf, &val)) {
                 mem->disp = val;
             } else {
-                strcpy(mem->disp_symbol, buf);
+                strncpy(mem->disp_symbol, buf,
+                        sizeof(mem->disp_symbol) - 1);
+                mem->disp_symbol[sizeof(mem->disp_symbol)-1] = '\0';
                 mem->has_disp_symbol = 1;
             }
         }
@@ -586,10 +622,11 @@ static void convert_att_mem(const char *s, char *out, size_t outsz) {
     char scale[8]  = {0};
 
     char tmp[64];
-    strncpy(tmp, inner, sizeof(tmp) - 1);
-    char *tok = strtok(tmp, ",");
-    if (tok) { strncpy(base,  trim(tok), sizeof(base)  - 1); tok = strtok(NULL, ","); }
-    if (tok) { strncpy(idx,   trim(tok), sizeof(idx)   - 1); tok = strtok(NULL, ","); }
+    strncpy(tmp, inner, sizeof(tmp) - 1); tmp[sizeof(tmp)-1] = '\0';
+    char *_saveptr = NULL;
+    char *tok = strtok_r(tmp, ",", &_saveptr);
+    if (tok) { strncpy(base,  trim(tok), sizeof(base)  - 1); tok = strtok_r(NULL, ",", &_saveptr); }
+    if (tok) { strncpy(idx,   trim(tok), sizeof(idx)   - 1); tok = strtok_r(NULL, ",", &_saveptr); }
     if (tok) { strncpy(scale, trim(tok), sizeof(scale) - 1); }
 
     /* Strip % from registers */
@@ -925,7 +962,8 @@ void assemble_line(char *line) {
         }
     }
     
-    char *op = strtok(line, " ,\t\n");
+    char *_al_save = NULL;
+    char *op = strtok_r(line, " \t\n", &_al_save);
     if (!op || op[0] == ';' || op[0] == '#') return;
     
     // Always process conditional directives even when skipping
@@ -936,10 +974,97 @@ void assemble_line(char *line) {
     } else if (skip) {
         return; // Skip this line
     }
-    
-    char *arg1 = strtok(NULL, " ,\t\n");
-    char *arg2 = strtok(NULL, " ,\t\n");
-    char *arg3 = strtok(NULL, " ,\t\n");
+
+    /* Split remaining text into up to 3 args, respecting brackets so that
+       commas inside [...] don't split an operand like [rip+.LC0]. */
+    char *rest = strtok_r(NULL, "", &_al_save);  /* everything after op */
+    char *arg1 = NULL, *arg2 = NULL, *arg3 = NULL;
+    static char _a1[MAX_LINE], _a2[MAX_LINE], _a3[MAX_LINE];
+    _a1[0] = _a2[0] = _a3[0] = '\0';
+
+    if (rest) {
+        /* skip leading whitespace */
+        while (*rest == ' ' || *rest == '\t') rest++;
+        /* find first top-level comma */
+        int depth = 0;
+        char *p = rest, *comma1 = NULL, *comma2 = NULL;
+        while (*p) {
+            if (*p == '[' || *p == '(') depth++;
+            else if (*p == ']' || *p == ')') depth--;
+            else if (*p == ',' && depth == 0) {
+                if (!comma1) comma1 = p;
+                else if (!comma2) { comma2 = p; break; }
+            }
+            p++;
+        }
+        if (comma1) {
+            size_t n1 = (size_t)(comma1 - rest);
+            if (n1 >= MAX_LINE) n1 = MAX_LINE - 1;
+            memcpy(_a1, rest, n1); _a1[n1] = '\0';
+            /* trim trailing whitespace */
+            char *e = _a1 + strlen(_a1);
+            while (e > _a1 && (e[-1]==' '||e[-1]=='\t')) *--e='\0';
+            arg1 = _a1;
+
+            char *second = comma1 + 1;
+            while (*second == ' ' || *second == '\t') second++;
+            if (comma2) {
+                size_t n2 = (size_t)(comma2 - second);
+                if (n2 >= MAX_LINE) n2 = MAX_LINE - 1;
+                memcpy(_a2, second, n2); _a2[n2] = '\0';
+                e = _a2 + strlen(_a2);
+                while (e > _a2 && (e[-1]==' '||e[-1]=='\t')) *--e='\0';
+                arg2 = _a2;
+                char *third = comma2 + 1;
+                while (*third == ' ' || *third == '\t') third++;
+                strncpy(_a3, third, MAX_LINE - 1); _a3[MAX_LINE-1] = '\0';
+                e = _a3 + strlen(_a3);
+                while (e > _a3 && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\n'||e[-1]=='\r')) *--e='\0';
+                if (_a3[0]) arg3 = _a3;
+            } else {
+                strncpy(_a2, second, MAX_LINE - 1); _a2[MAX_LINE-1] = '\0';
+                e = _a2 + strlen(_a2);
+                while (e > _a2 && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\n'||e[-1]=='\r')) *--e='\0';
+                if (_a2[0]) arg2 = _a2;
+            }
+        } else {
+            /* no comma — try space-splitting (for directives like .equ, .fill, .space) */
+            strncpy(_a1, rest, MAX_LINE - 1); _a1[MAX_LINE-1] = '\0';
+            char *e = _a1 + strlen(_a1);
+            while (e > _a1 && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\n'||e[-1]=='\r')) *--e='\0';
+            if (_a1[0]) {
+                arg1 = _a1;
+                /* find first space after arg1 */
+                char *sp = _a1;
+                while (*sp && *sp!=' ' && *sp!='\t') sp++;
+                if (*sp) {
+                    *sp++ = '\0';
+                    while (*sp==' '||*sp=='\t') sp++;
+                    if (*sp) {
+                        strncpy(_a2, sp, MAX_LINE-1); _a2[MAX_LINE-1]='\0';
+                        e = _a2+strlen(_a2);
+                        while (e>_a2&&(e[-1]==' '||e[-1]=='\t'||e[-1]=='\n'||e[-1]=='\r')) *--e='\0';
+                        if (_a2[0]) {
+                            arg2 = _a2;
+                            /* find second space for arg3 */
+                            char *sp2 = _a2;
+                            while (*sp2 && *sp2!=' ' && *sp2!='\t') sp2++;
+                            if (*sp2) {
+                                *sp2++ = '\0';
+                                while (*sp2==' '||*sp2=='\t') sp2++;
+                                if (*sp2) {
+                                    strncpy(_a3, sp2, MAX_LINE-1); _a3[MAX_LINE-1]='\0';
+                                    e = _a3+strlen(_a3);
+                                    while (e>_a3&&(e[-1]==' '||e[-1]=='\t'||e[-1]=='\n'||e[-1]=='\r')) *--e='\0';
+                                    if (_a3[0]) arg3 = _a3;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     
     if (strcasecmp(op, ".section") == 0 && arg1) {
         if (strcasecmp(arg1, ".text") == 0) current_section = 0;
@@ -1182,8 +1307,13 @@ void assemble_line(char *line) {
         op[strlen(op)-1] = 0;
         int idx = get_symbol(op);
         if (idx < 0) return;
-        if (current_section == 0) symbols[idx].value = code_size;
-        else if (current_section == 1) symbols[idx].value = code_size + 0x1000;
+        if (current_section == 0) {
+            /* Text label: store code offset; will be fixed up to VA in write_elf */
+            symbols[idx].value = code_size;
+        } else {
+            /* Data/rodata label: store data offset with high bit set to mark as data */
+            symbols[idx].value = data_size | 0x80000000u;
+        }
         symbols[idx].defined = 1;
         return;
     }
@@ -1205,13 +1335,16 @@ void assemble_line(char *line) {
                 emit_dword(imm);
             }
         } else if ((r2 = parse_reg(arg2)) != -1) {
+            /* MOV r/m, r  (0x89): reg=src(r2), r/m=dst(r1)
+               REX.R extends src(r2), REX.B extends dst(r1) */
             if (is_64bit_reg(arg1) || is_64bit_reg(arg2) || needs_rex(arg1) || needs_rex(arg2)) {
-                emit_rex(is_64bit_reg(arg1) ? 1 : 0, needs_rex(arg2) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
+                emit_rex(is_64bit_reg(arg1) || is_64bit_reg(arg2) ? 1 : 0,
+                         needs_rex(arg2) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
                 emit_byte(0x89);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             } else {
                 emit_byte(0x89);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             }
         } else if (parse_mem_operand(arg2, &mem)) {
             if (is_64bit_reg(arg1) || needs_rex(arg1)) {
@@ -1268,10 +1401,10 @@ void assemble_line(char *line) {
             if (is_64bit_reg(arg1) || is_64bit_reg(arg2) || needs_rex(arg1) || needs_rex(arg2)) {
                 emit_rex(is_64bit_reg(arg1) ? 1 : 0, needs_rex(arg2) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
                 emit_byte(0x01);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             } else {
                 emit_byte(0x01);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             }
         } else if (parse_mem_operand(arg2, &mem)) {
             if (is_64bit_reg(arg1) || needs_rex(arg1)) {
@@ -1318,10 +1451,10 @@ void assemble_line(char *line) {
             if (is_64bit_reg(arg1) || is_64bit_reg(arg2) || needs_rex(arg1) || needs_rex(arg2)) {
                 emit_rex(is_64bit_reg(arg1) ? 1 : 0, needs_rex(arg2) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
                 emit_byte(0x29);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             } else {
                 emit_byte(0x29);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             }
         } else if (parse_mem_operand(arg2, &mem)) {
             if (is_64bit_reg(arg1) || needs_rex(arg1)) {
@@ -1355,10 +1488,10 @@ void assemble_line(char *line) {
             if (is_64bit_reg(arg1) || is_64bit_reg(arg2) || needs_rex(arg1) || needs_rex(arg2)) {
                 emit_rex(is_64bit_reg(arg1) ? 1 : 0, needs_rex(arg2) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
                 emit_byte(0x21);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             } else {
                 emit_byte(0x21);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             }
         } else if (parse_mem_operand(arg2, &mem)) {
             if (is_64bit_reg(arg1) || needs_rex(arg1)) {
@@ -1392,10 +1525,10 @@ void assemble_line(char *line) {
             if (is_64bit_reg(arg1) || is_64bit_reg(arg2) || needs_rex(arg1) || needs_rex(arg2)) {
                 emit_rex(is_64bit_reg(arg1) ? 1 : 0, needs_rex(arg2) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
                 emit_byte(0x09);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             } else {
                 emit_byte(0x09);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             }
         } else if (parse_mem_operand(arg2, &mem)) {
             if (is_64bit_reg(arg1) || needs_rex(arg1)) {
@@ -1429,10 +1562,10 @@ void assemble_line(char *line) {
             if (is_64bit_reg(arg1) || is_64bit_reg(arg2) || needs_rex(arg1) || needs_rex(arg2)) {
                 emit_rex(is_64bit_reg(arg1) ? 1 : 0, needs_rex(arg2) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
                 emit_byte(0x31);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             } else {
                 emit_byte(0x31);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             }
         } else if (parse_mem_operand(arg2, &mem)) {
             if (is_64bit_reg(arg1) || needs_rex(arg1)) {
@@ -1625,10 +1758,10 @@ void assemble_line(char *line) {
             if (is_64bit_reg(arg1) || is_64bit_reg(arg2) || needs_rex(arg1) || needs_rex(arg2)) {
                 emit_rex(is_64bit_reg(arg1) ? 1 : 0, needs_rex(arg2) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
                 emit_byte(0x39);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             } else {
                 emit_byte(0x39);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             }
         } else if (parse_mem_operand(arg2, &mem)) {
             if (is_64bit_reg(arg1) || needs_rex(arg1)) {
@@ -1652,10 +1785,10 @@ void assemble_line(char *line) {
             if (is_64bit_reg(arg1) || is_64bit_reg(arg2) || needs_rex(arg1) || needs_rex(arg2)) {
                 emit_rex(is_64bit_reg(arg1) ? 1 : 0, needs_rex(arg2) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
                 emit_byte(0x85);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             } else {
                 emit_byte(0x85);
-                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
             }
         } else if (parse_mem_operand(arg2, &mem)) {
             if (is_64bit_reg(arg1) || needs_rex(arg1)) {
@@ -1759,14 +1892,11 @@ void assemble_line(char *line) {
     }
     else if (strcasecmp(op, "push") == 0 && arg1) {
         r1 = parse_reg(arg1);
-        int is_64bit = is_64bit_reg(arg1);
         if (r1 != -1) {
-            if (is_64bit || needs_rex(arg1)) {
-                emit_rex(is_64bit ? 1 : 0, 0, 0, needs_rex(arg1) ? 1 : 0);
-                emit_byte(0x50 + (r1 & 7));
-            } else {
-                emit_byte(0x50 + r1);
-            }
+            /* PUSH is 64-bit by default in 64-bit mode; REX only needed for r8-r15 */
+            if (needs_rex(arg1))
+                emit_rex(0, 0, 0, 1); /* REX.B only */
+            emit_byte(0x50 + (r1 & 7));
         } else if (parse_imm(arg1, &imm)) {
             emit_byte(0x68);
             emit_dword(imm);
@@ -1774,14 +1904,11 @@ void assemble_line(char *line) {
     }
     else if (strcasecmp(op, "pop") == 0 && arg1) {
         r1 = parse_reg(arg1);
-        int is_64bit = is_64bit_reg(arg1);
         if (r1 != -1) {
-            if (is_64bit || needs_rex(arg1)) {
-                emit_rex(is_64bit ? 1 : 0, 0, 0, needs_rex(arg1) ? 1 : 0);
-                emit_byte(0x58 + (r1 & 7));
-            } else {
-                emit_byte(0x58 + r1);
-            }
+            /* POP is 64-bit by default in 64-bit mode; REX only needed for r8-r15 */
+            if (needs_rex(arg1))
+                emit_rex(0, 0, 0, 1); /* REX.B only */
+            emit_byte(0x58 + (r1 & 7));
         }
     }
     else if (strcasecmp(op, "pusha") == 0) {
@@ -2388,6 +2515,28 @@ void assemble_line(char *line) {
     }
 }
 
+/* Virtual address layout matching write_elf() */
+#define ELF_LOAD_BASE  0x400000u
+#define ELF_EHDR_SIZE  64u
+#define ELF_PHDR_SIZE  56u
+
+static uint32_t elf_text_va(void) {
+    return ELF_LOAD_BASE + ELF_EHDR_SIZE + (ELF_PHDR_SIZE * 2);
+}
+static uint32_t elf_data_va(void) {
+    uint32_t text_off = ELF_EHDR_SIZE + (ELF_PHDR_SIZE * 2);
+    uint32_t data_off = text_off + ((code_size + 15) & ~15);
+    return ELF_LOAD_BASE + data_off;
+}
+
+/* Resolve stored symbol value to absolute VA.
+   Data symbols are tagged with bit 31 set. */
+static uint32_t symbol_va(uint32_t v) {
+    if (v & 0x80000000u)
+        return elf_data_va() + (v & ~0x80000000u);
+    return elf_text_va() + v;
+}
+
 void resolve_relocs(void) {
     for (int i = 0; i < reloc_count; i++) {
         int sym_idx = get_symbol(relocs[i].symbol);
@@ -2396,22 +2545,24 @@ void resolve_relocs(void) {
         int section = relocs[i].type >> 8;
         int type    = relocs[i].type & 0xff;
         uint32_t off = relocs[i].offset;
+        uint32_t sym_va = symbol_va(symbols[sym_idx].value);
 
         if (section == 0) {
-            if (off + 4 > code_size) continue; /* bounds check */
+            if (off + 4 > code_size) continue;
             if (type == 2) {
-                /* 8-bit relative (loop/loope/loopne) */
-                int32_t rel = (int32_t)symbols[sym_idx].value - (int32_t)off - 1;
+                /* 8-bit relative */
+                uint32_t next_va = elf_text_va() + off + 1;
+                int32_t rel = (int32_t)(sym_va - next_va);
                 code[off] = (uint8_t)(rel & 0xff);
             } else {
-                /* 32-bit relative */
-                int32_t rel = (int32_t)symbols[sym_idx].value - (int32_t)off - 4;
+                /* 32-bit relative: displacement from end of the 4-byte field */
+                uint32_t next_va = elf_text_va() + off + 4;
+                int32_t rel = (int32_t)(sym_va - next_va);
                 memcpy(code + off, &rel, 4);
             }
         } else if (section == 1) {
             if (off + 4 > data_size) continue;
-            uint32_t val = symbols[sym_idx].value;
-            memcpy(data + off, &val, 4);
+            memcpy(data + off, &sym_va, 4);
         }
     }
 }
@@ -2429,7 +2580,15 @@ void write_elf(const char *filename) {
     uint32_t sh_off = data_off + ((data_size + 15) & ~15);
     uint32_t text_size = code_size;
     uint32_t ds = data_size;  // local alias to avoid shadowing the global
+
+    /* Set entry point from _start or main symbol */
     uint64_t entry = 0;
+    {
+        int ei = get_symbol("_start");
+        if (ei < 0 || !symbols[ei].defined) ei = get_symbol("main");
+        if (ei >= 0 && symbols[ei].defined)
+            entry = symbol_va(symbols[ei].value);
+    }
     
     // ELF64 Header
     uint8_t ehdr[64] = {0};
