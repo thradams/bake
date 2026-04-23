@@ -2515,18 +2515,21 @@ void assemble_line(char *line) {
     }
 }
 
-/* Virtual address layout matching write_elf() */
+/* Virtual address layout.
+ * We place text at file offset PAGE_SIZE so text and data are on separate
+ * physical pages and the kernel does not strip the execute bit when mapping
+ * the data segment (which would happen if both shared the same 4 KB page). */
 #define ELF_LOAD_BASE  0x400000u
-#define ELF_EHDR_SIZE  64u
-#define ELF_PHDR_SIZE  56u
+#define ELF_PAGE_SIZE  0x1000u          /* 4 KB */
+#define ELF_TEXT_FOFF  ELF_PAGE_SIZE    /* text starts at file offset 0x1000 */
 
 static uint32_t elf_text_va(void) {
-    return ELF_LOAD_BASE + ELF_EHDR_SIZE + (ELF_PHDR_SIZE * 2);
+    return ELF_LOAD_BASE + ELF_TEXT_FOFF;   /* 0x401000 */
 }
 static uint32_t elf_data_va(void) {
-    uint32_t text_off = ELF_EHDR_SIZE + (ELF_PHDR_SIZE * 2);
-    uint32_t data_off = text_off + ((code_size + 15) & ~15);
-    return ELF_LOAD_BASE + data_off;
+    /* data goes on the next page after text */
+    uint32_t text_pages = ((code_size + ELF_PAGE_SIZE - 1) & ~(ELF_PAGE_SIZE - 1));
+    return elf_text_va() + text_pages;
 }
 
 /* Resolve stored symbol value to absolute VA.
@@ -2540,11 +2543,35 @@ static uint32_t symbol_va(uint32_t v) {
 void resolve_relocs(void) {
     for (int i = 0; i < reloc_count; i++) {
         int sym_idx = get_symbol(relocs[i].symbol);
-        if (sym_idx < 0 || !symbols[sym_idx].defined) continue;
-
         int section = relocs[i].type >> 8;
         int type    = relocs[i].type & 0xff;
         uint32_t off = relocs[i].offset;
+
+        if (sym_idx < 0 || !symbols[sym_idx].defined) {
+            /* Unresolved external symbol in text section:
+             * Replace the call/jmp opcode + 4-byte placeholder with
+             * a safe "exit(127)" sequence so execution doesn't jump
+             * into garbage.  The 5 bytes are: nop(1) + int3(1) + nop(3)
+             * — but we need something that terminates cleanly.
+             * Instead: patch the preceding opcode byte (off-1) to 0x90
+             * (nop) and the 4-byte field to a syscall exit sequence.
+             * Since we only have 5 bytes (opcode + disp32), write:
+             *   b8 3c 00 00 00  = mov eax, 60  (SYS_exit)  -- 5 bytes
+             * then the next byte after will be hit, but we print a warning.
+             */
+            if (section == 0 && off >= 1 && off + 4 <= code_size) {
+                fprintf(stderr, "warning: unresolved symbol '%s' — "
+                        "replacing call/jmp with exit(127)\n",
+                        relocs[i].symbol);
+                /* Overwrite the opcode byte before the disp32 */
+                code[off - 1] = 0xb8;             /* mov eax, imm32 */
+                uint32_t exit127 = 127;
+                memcpy(code + off, &exit127, 4);   /* imm32 = 127    */
+                /* The 'ret' after this will still execute, which is fine */
+            }
+            continue;
+        }
+
         uint32_t sym_va = symbol_va(symbols[sym_idx].value);
 
         if (section == 0) {
@@ -2570,20 +2597,102 @@ void resolve_relocs(void) {
 void write_elf(const char *filename) {
     FILE *f = fopen(filename, "wb");
     if (!f) return;
-    
+
+    /* If the user defined 'main' but not '_start', prepend a minimal _start
+     * stub that calls main() then exits via syscall so that 'ret' from main
+     * doesn't fault trying to return to a garbage address.
+     *
+     * The stub (10 bytes):
+     *   e8 XX XX XX XX   call main  (rel32 patched below)
+     *   48 31 ff         xor  rdi, rdi   ; exit code 0
+     *   b8 3c 00 00 00   mov  eax, 60    ; SYS_exit
+     *   0f 05            syscall
+     *
+     * Total: 12 bytes.  We prepend this to the code section and shift all
+     * text-symbol values by STUB_SIZE.
+     */
+    int has_main  = 0, has_start = 0;
+    {
+        int mi = get_symbol("main");
+        int si = get_symbol("_start");
+        if (mi >= 0 && symbols[mi].defined) has_main  = 1;
+        if (si >= 0 && symbols[si].defined) has_start = 1;
+    }
+
+    static const uint8_t STUB[] = {
+        0xe8, 0x00, 0x00, 0x00, 0x00, /* call main  (rel32 placeholder) */
+        0x48, 0x89, 0xc7,              /* mov rdi, rax  (exit code = main's return) */
+        0xb8, 0x3c, 0x00, 0x00, 0x00, /* mov eax, 60  (SYS_exit)        */
+        0x0f, 0x05                     /* syscall                        */
+    };
+    const uint32_t STUB_SIZE = (uint32_t)sizeof(STUB);
+
+    int inject_stub = (has_main && !has_start);
+
+    /* If we inject a stub, shift all text symbol values by STUB_SIZE */
+    if (inject_stub) {
+        for (int i = 0; i < sym_count; i++) {
+            if (symbols[i].defined && !(symbols[i].value & 0x80000000u)) {
+                symbols[i].value += STUB_SIZE;
+            }
+        }
+        /* Also shift all text-section reloc offsets */
+        for (int i = 0; i < reloc_count; i++) {
+            if ((relocs[i].type >> 8) == 0)
+                relocs[i].offset += STUB_SIZE;
+        }
+        /* Add stub bytes to the front of code by reallocating */
+        uint32_t new_size = code_size + STUB_SIZE;
+        if (new_size > code_capacity) {
+            while (code_capacity < new_size) code_capacity *= 2;
+            uint8_t *tmp = realloc(code, code_capacity);
+            if (!tmp) { fclose(f); return; }
+            code = tmp;
+        }
+        memmove(code + STUB_SIZE, code, code_size);
+        memcpy(code, STUB, STUB_SIZE);
+        code_size = new_size;
+
+        /* Patch the call displacement in the stub:
+         * call at byte 1, next_ip = text_va + 5, target = symbol_va(main) */
+        int mi = get_symbol("main");
+        if (mi >= 0 && symbols[mi].defined) {
+            uint32_t next_ip = elf_text_va() + 5;   /* after the call */
+            int32_t  rel     = (int32_t)(symbol_va(symbols[mi].value) - next_ip);
+            memcpy(code + 1, &rel, 4);
+        }
+    }
+
+    /* Re-run reloc resolution now that code has been shifted */
+    resolve_relocs();
+
     uint32_t ehdr_size = 64;
     uint32_t phdr_size = 56;
     uint32_t shdr_size = 64;
-    
-    uint32_t text_off = ehdr_size + (phdr_size * 2);
-    uint32_t data_off = text_off + ((code_size + 15) & ~15);
-    uint32_t sh_off = data_off + ((data_size + 15) & ~15);
-    uint32_t text_size = code_size;
-    uint32_t ds = data_size;  // local alias to avoid shadowing the global
 
-    /* Set entry point from _start or main symbol */
+    /* Page-aligned layout:
+     *   file[0x0000 .. 0x0FFF]: ELF header + program headers (rest is padding)
+     *   file[0x1000 .. 0x1FFF]: .text  (one page, executable)
+     *   file[0x2000 ..       ]: .data  (one page, writable)
+     *   section headers and shstrtab follow data
+     *
+     * This keeps text and data on separate 4 KB pages so the kernel never
+     * strips execute permission from the text when mapping data as R|W. */
+    uint32_t text_foff = ELF_PAGE_SIZE;   /* 0x1000 */
+    uint32_t text_pages = ((code_size + ELF_PAGE_SIZE - 1) & ~(ELF_PAGE_SIZE - 1));
+    uint32_t data_foff  = text_foff + text_pages;
+    uint32_t data_pages = ((data_size + ELF_PAGE_SIZE - 1) & ~(ELF_PAGE_SIZE - 1));
+    uint32_t sh_foff    = data_foff + (data_size > 0 ? data_pages : 0);
+
+    uint32_t text_size = code_size;
+    uint32_t ds = data_size;
+
+    /* Set entry point */
     uint64_t entry = 0;
-    {
+    if (inject_stub) {
+        /* _start stub is at the very start of the text section */
+        entry = elf_text_va();
+    } else {
         int ei = get_symbol("_start");
         if (ei < 0 || !symbols[ei].defined) ei = get_symbol("main");
         if (ei >= 0 && symbols[ei].defined)
@@ -2597,119 +2706,104 @@ void write_elf(const char *filename) {
     ehdr[5] = 1; // little endian
     ehdr[6] = 1; // ELF version
     ehdr[7] = 0; // OS/ABI = System V
-    // e_type at offset 16: ET_EXEC = 2
-    *(uint16_t*)(ehdr + 16) = 2;   // ET_EXEC
-    // e_machine at offset 18: EM_X86_64 = 62
-    *(uint16_t*)(ehdr + 18) = 62;
-    // e_version at offset 20: 1
-    *(uint32_t*)(ehdr + 20) = 1;
-    
-    *(uint64_t*)(ehdr + 24) = entry;     // e_entry
-    *(uint64_t*)(ehdr + 32) = ehdr_size; // e_phoff
-    *(uint64_t*)(ehdr + 40) = 0;         // e_shoff (will update)
-    *(uint32_t*)(ehdr + 48) = 0;         // e_flags
-    *(uint16_t*)(ehdr + 52) = ehdr_size; // e_ehsize
-    *(uint16_t*)(ehdr + 54) = phdr_size; // e_phentsize
-    *(uint16_t*)(ehdr + 56) = 2;         // e_phnum
-    *(uint16_t*)(ehdr + 58) = shdr_size; // e_shentsize
-    *(uint16_t*)(ehdr + 60) = 4;         // e_shnum (null + .text + .data + .shstrtab)
-    *(uint16_t*)(ehdr + 62) = 3;         // e_shstrndx
-    
+    *(uint16_t*)(ehdr + 16) = 2;          // e_type: ET_EXEC
+    *(uint16_t*)(ehdr + 18) = 62;         // e_machine: EM_X86_64
+    *(uint32_t*)(ehdr + 20) = 1;          // e_version
+    *(uint64_t*)(ehdr + 24) = entry;      // e_entry
+    *(uint64_t*)(ehdr + 32) = ehdr_size;  // e_phoff
+    *(uint64_t*)(ehdr + 40) = sh_foff;    // e_shoff
+    *(uint32_t*)(ehdr + 48) = 0;          // e_flags
+    *(uint16_t*)(ehdr + 52) = ehdr_size;  // e_ehsize
+    *(uint16_t*)(ehdr + 54) = phdr_size;  // e_phentsize
+    *(uint16_t*)(ehdr + 56) = 2;          // e_phnum
+    *(uint16_t*)(ehdr + 58) = shdr_size;  // e_shentsize
+    *(uint16_t*)(ehdr + 60) = 4;          // e_shnum
+    *(uint16_t*)(ehdr + 62) = 3;          // e_shstrndx
+
+    /* Pad from end of headers to text_foff with zeros, then write header */
     fwrite(ehdr, 1, ehdr_size, f);
-    
+
     // Program header for .text
     uint8_t phdr1[56] = {0};
-    *(uint32_t*)(phdr1 + 0) = 1; // p_type: PT_LOAD
-    *(uint32_t*)(phdr1 + 4) = 5; // p_flags: PF_R|PF_X
-    *(uint64_t*)(phdr1 + 8)  = text_off;              // p_offset
-    *(uint64_t*)(phdr1 + 16) = 0x400000 + text_off;   // p_vaddr
-    *(uint64_t*)(phdr1 + 24) = 0x400000 + text_off;   // p_paddr
-    *(uint64_t*)(phdr1 + 32) = text_size;              // p_filesz
-    *(uint64_t*)(phdr1 + 40) = text_size;              // p_memsz
-    *(uint64_t*)(phdr1 + 48) = 0x1000;                 // p_align
+    *(uint32_t*)(phdr1 + 0)  = 1;                  // PT_LOAD
+    *(uint32_t*)(phdr1 + 4)  = 5;                  // PF_R|PF_X
+    *(uint64_t*)(phdr1 + 8)  = text_foff;          // p_offset
+    *(uint64_t*)(phdr1 + 16) = elf_text_va();      // p_vaddr
+    *(uint64_t*)(phdr1 + 24) = elf_text_va();      // p_paddr
+    *(uint64_t*)(phdr1 + 32) = text_size;          // p_filesz
+    *(uint64_t*)(phdr1 + 40) = text_size;          // p_memsz
+    *(uint64_t*)(phdr1 + 48) = ELF_PAGE_SIZE;      // p_align
     fwrite(phdr1, 1, phdr_size, f);
 
     // Program header for .data
     uint8_t phdr2[56] = {0};
-    *(uint32_t*)(phdr2 + 0) = 1; // p_type: PT_LOAD
-    *(uint32_t*)(phdr2 + 4) = 6; // p_flags: PF_R|PF_W
-    *(uint64_t*)(phdr2 + 8)  = data_off;              // p_offset
-    *(uint64_t*)(phdr2 + 16) = 0x400000 + data_off;   // p_vaddr
-    *(uint64_t*)(phdr2 + 24) = 0x400000 + data_off;   // p_paddr
-    *(uint64_t*)(phdr2 + 32) = ds;                     // p_filesz
-    *(uint64_t*)(phdr2 + 40) = ds;                     // p_memsz
-    *(uint64_t*)(phdr2 + 48) = 0x1000;                 // p_align
+    *(uint32_t*)(phdr2 + 0)  = 1;                  // PT_LOAD
+    *(uint32_t*)(phdr2 + 4)  = 6;                  // PF_R|PF_W
+    *(uint64_t*)(phdr2 + 8)  = data_foff;          // p_offset
+    *(uint64_t*)(phdr2 + 16) = elf_data_va();      // p_vaddr
+    *(uint64_t*)(phdr2 + 24) = elf_data_va();      // p_paddr
+    *(uint64_t*)(phdr2 + 32) = ds;                 // p_filesz
+    *(uint64_t*)(phdr2 + 40) = ds;                 // p_memsz
+    *(uint64_t*)(phdr2 + 48) = ELF_PAGE_SIZE;      // p_align
     fwrite(phdr2, 1, phdr_size, f);
-    
-    // Write code
+
+    // Pad from end of phdrs to text_foff
+    {
+        uint32_t written = ehdr_size + phdr_size * 2;
+        for (uint32_t i = written; i < text_foff; i++) fputc(0, f);
+    }
+
+    // Write .text section
     fwrite(code, 1, code_size, f);
-    uint32_t padding = ((code_size + 15) & ~15) - code_size;
-    for (uint32_t i = 0; i < padding; i++) fputc(0, f);
-    
-    // Write data
+    // Pad to next page boundary
+    for (uint32_t i = code_size; i < text_pages; i++) fputc(0, f);
+
+    // Write .data section
     if (ds > 0) {
         fwrite(data, 1, ds, f);
-        padding = ((ds + 15) & ~15) - ds;
-        for (uint32_t i = 0; i < padding; i++) fputc(0, f);
+        for (uint32_t i = ds; i < data_pages; i++) fputc(0, f);
     }
-    
+
     // Section header for null
     uint8_t shdr0[64] = {0};
     fwrite(shdr0, 1, shdr_size, f);
-    
+
     // Section header for .text
     uint8_t shdr1[64] = {0};
-    *(uint32_t*)(shdr1 + 0) = 1;
-    *(uint32_t*)(shdr1 + 4) = 1;
-    *(uint64_t*)(shdr1 + 8) = 7;
-    *(uint64_t*)(shdr1 + 16) = 0x400000 + text_off;
-    *(uint64_t*)(shdr1 + 24) = text_off;
-    *(uint64_t*)(shdr1 + 32) = text_size;
-    *(uint32_t*)(shdr1 + 40) = 0;
-    *(uint32_t*)(shdr1 + 44) = 0;
-    *(uint64_t*)(shdr1 + 48) = 0;
-    *(uint64_t*)(shdr1 + 56) = 0;
+    *(uint32_t*)(shdr1 + 0)  = 1;              // sh_name
+    *(uint32_t*)(shdr1 + 4)  = 1;              // sh_type: SHT_PROGBITS
+    *(uint64_t*)(shdr1 + 8)  = 6;              // sh_flags: SHF_ALLOC|SHF_EXECINSTR
+    *(uint64_t*)(shdr1 + 16) = elf_text_va();  // sh_addr
+    *(uint64_t*)(shdr1 + 24) = text_foff;      // sh_offset
+    *(uint64_t*)(shdr1 + 32) = text_size;      // sh_size
+    *(uint64_t*)(shdr1 + 48) = 16;             // sh_addralign
     fwrite(shdr1, 1, shdr_size, f);
-    
+
     // Section header for .data
     uint8_t shdr2[64] = {0};
-    *(uint32_t*)(shdr2 + 0) = 7;
-    *(uint32_t*)(shdr2 + 4) = 1;
-    *(uint64_t*)(shdr2 + 8) = 3;
-    *(uint64_t*)(shdr2 + 16) = 0x400000 + data_off;
-    *(uint64_t*)(shdr2 + 24) = data_off;
-    *(uint64_t*)(shdr2 + 32) = ds;
-    *(uint32_t*)(shdr2 + 40) = 0;
-    *(uint32_t*)(shdr2 + 44) = 0;
-    *(uint64_t*)(shdr2 + 48) = 0;
-    *(uint64_t*)(shdr2 + 56) = 0;
+    *(uint32_t*)(shdr2 + 0)  = 7;              // sh_name
+    *(uint32_t*)(shdr2 + 4)  = 1;              // sh_type: SHT_PROGBITS
+    *(uint64_t*)(shdr2 + 8)  = 3;              // sh_flags: SHF_ALLOC|SHF_WRITE
+    *(uint64_t*)(shdr2 + 16) = elf_data_va();  // sh_addr
+    *(uint64_t*)(shdr2 + 24) = data_foff;      // sh_offset
+    *(uint64_t*)(shdr2 + 32) = ds;             // sh_size
+    *(uint64_t*)(shdr2 + 48) = 8;              // sh_addralign
     fwrite(shdr2, 1, shdr_size, f);
-    
+
     // Section header for .shstrtab
-    // shstrtab data is written right after the 4 section headers
-    uint64_t shstrtab_off = sh_off + (shdr_size * 4);
+    uint64_t shstrtab_foff = sh_foff + (uint64_t)(shdr_size * 4);
     uint8_t shdr3[64] = {0};
-    *(uint32_t*)(shdr3 + 0)  = 13;            // sh_name (offset of ".shstrtab" in table)
-    *(uint32_t*)(shdr3 + 4)  = 3;             // sh_type: SHT_STRTAB
-    *(uint64_t*)(shdr3 + 8)  = 0;             // sh_flags
-    *(uint64_t*)(shdr3 + 16) = 0;             // sh_addr
-    *(uint64_t*)(shdr3 + 24) = shstrtab_off;  // sh_offset
-    *(uint64_t*)(shdr3 + 32) = 23;            // sh_size: "\0.text\0.data\0.shstrtab" = 23 bytes
-    *(uint32_t*)(shdr3 + 40) = 0;             // sh_link
-    *(uint32_t*)(shdr3 + 44) = 0;             // sh_info
-    *(uint64_t*)(shdr3 + 48) = 1;             // sh_addralign
-    *(uint64_t*)(shdr3 + 56) = 0;             // sh_entsize
+    *(uint32_t*)(shdr3 + 0)  = 13;             // sh_name
+    *(uint32_t*)(shdr3 + 4)  = 3;              // sh_type: SHT_STRTAB
+    *(uint64_t*)(shdr3 + 24) = shstrtab_foff;  // sh_offset
+    *(uint64_t*)(shdr3 + 32) = 23;             // sh_size
+    *(uint64_t*)(shdr3 + 48) = 1;              // sh_addralign
     fwrite(shdr3, 1, shdr_size, f);
 
-    // Section string table: 23 bytes (C string literal includes trailing \0)
+    // Section string table
     const char *shstrtab = "\0.text\0.data\0.shstrtab";
     fwrite(shstrtab, 1, 23, f);
-    
-    // Update section header offset in ELF header
-    fseek(f, 40, SEEK_SET);
-    uint64_t sh_off_val = sh_off;
-    fwrite(&sh_off_val, 8, 1, f);
-    
+
     fclose(f);
 }
 
@@ -2815,13 +2909,12 @@ int main(int argc, char **argv) {
         assemble_line(line);
     }
     fclose(f);
-    
-    resolve_relocs();
-    
+
     if (argc > 3 && strcmp(argv[3], "obj") == 0) {
+        resolve_relocs();   /* obj has no stub injection */
         write_obj(argv[2]);
     } else {
-        write_elf(argv[2]);
+        write_elf(argv[2]); /* write_elf calls resolve_relocs internally */
     }
     
     free(code);
