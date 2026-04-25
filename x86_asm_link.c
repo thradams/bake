@@ -130,11 +130,19 @@ void emit_qword(uint64_t q) {
 
 void add_reloc(uint32_t offset, const char *symbol, int type) {
     if (reloc_count < MAX_RELOCS) {
-        /* 'offset' is unused legacy parameter — the reloc always patches
-           the dword at the current emit position (code_size or data_size). */
         (void)offset;
         relocs[reloc_count].offset = (current_section == 0 ? code_size : data_size);
-        strncpy(relocs[reloc_count].symbol, symbol,
+
+        /* Strip ELF dynamic-linking suffixes: @PLT, @GOT, @GOTPCREL, etc.
+         * These are used in GAS output for shared-library calls but we
+         * assemble as a static binary, so just use the bare symbol name. */
+        char clean[64];
+        strncpy(clean, symbol, sizeof(clean) - 1);
+        clean[sizeof(clean) - 1] = '\0';
+        char *at = strchr(clean, '@');
+        if (at) *at = '\0';
+
+        strncpy(relocs[reloc_count].symbol, clean,
                 sizeof(relocs[reloc_count].symbol) - 1);
         relocs[reloc_count].symbol[sizeof(relocs[reloc_count].symbol)-1] = '\0';
         relocs[reloc_count].type = type | (current_section << 8);
@@ -696,10 +704,21 @@ static void strip_size_suffix(char *op) {
         "mov","push","pop","add","sub","and","or","xor","cmp","test",
         "lea","call","ret","jmp","inc","dec","neg","not","mul","imul",
         "div","idiv","xchg","movsx","movzx","adc","sbb","rol","ror",
-        "shl","sal","shr","sar","leave","enter","xor","cmpxchg",NULL
+        "shl","sal","shr","sar","leave","enter","xor","cmpxchg",
+        /* AT&T compound zero/sign-extend: movzb, movzw, movsb, movsw */
+        "movzb","movzw","movsb","movsw","movzl","movsl",NULL
     };
     for (int i = 0; known[i]; i++) {
-        if (strcasecmp(op, known[i]) == 0) return; /* keep stripped */
+        if (strcasecmp(op, known[i]) == 0) {
+            /* Map AT&T compound extend mnemonics to Intel equivalents */
+            if (strncasecmp(op, "movzb", 5) == 0 || strncasecmp(op, "movzw", 5) == 0 ||
+                strncasecmp(op, "movzl", 5) == 0)
+                strcpy(op, "movzx");
+            else if (strncasecmp(op, "movsb", 5) == 0 || strncasecmp(op, "movsw", 5) == 0 ||
+                     strncasecmp(op, "movsl", 5) == 0)
+                strcpy(op, "movsx");
+            return; /* keep stripped */
+        }
     }
     /* Not a known mnemonic without suffix — restore */
     op[len - 1] = last;
@@ -854,21 +873,17 @@ static int normalize_att_line(char *line) {
     {
         char *colon = strchr(trimmed, ':');
         if (colon && (colon[1] == '\0' || colon[1] == ' ' || colon[1] == '\t')) {
-            /* Emit the label on this line, then recursively handle rest */
-            *colon = '\0';
-            snprintf(line, MAX_LINE, "%s:", trimmed);
             char *after = trim(colon + 1);
             if (after && *after) {
-                /* There's an instruction after the label — handle it next pass */
-                /* For simplicity, assemble the label now and put remainder back */
-                char remainder[MAX_LINE];
-                snprintf(remainder, MAX_LINE, "%s", after);
-                /* We can't recurse here (line is in-out); just append a
-                   newline so the caller sees the label and stops.
-                   The instruction after ':' on the same line is unusual in
-                   GAS output but handle it by queuing into work buffer. */
-                /* Terminate: caller will process the label, the rest is lost.
-                   Real GAS rarely puts code after label on same line. */
+                /* "label: instruction" — keep both on one line.
+                 * assemble_line's label handler will process the label
+                 * then recursively assemble the remainder. */
+                *colon = '\0';
+                snprintf(line, MAX_LINE, "%s: %s", trimmed, after);
+            } else {
+                /* Label alone */
+                *colon = '\0';
+                snprintf(line, MAX_LINE, "%s:", trimmed);
             }
             return 1;
         }
@@ -944,6 +959,36 @@ static int normalize_att_line(char *line) {
         snprintf(line, MAX_LINE, "%s %s", mnemonic, op1);
     }
     return 1;
+}
+
+/* Strip Intel operand size hints (byte/word/dword/qword) from arg strings.
+ * Handles two forms:
+ *   embedded prefix: "byte [rax]"  -> "[rax]"   (in-place)
+ *   separate token:  arg2="byte", arg3="[rax]"  -> arg2="[rax]", arg3=NULL */
+static int is_size_hint_word(const char *s) {
+    if (!s) return 0;
+    return strcasecmp(s,"byte")==0 || strcasecmp(s,"word")==0 ||
+           strcasecmp(s,"dword")==0 || strcasecmp(s,"qword")==0 ||
+           strcasecmp(s,"tbyte")==0 || strcasecmp(s,"ptr")==0 ||
+           strcasecmp(s,"xmmword")==0 || strcasecmp(s,"ymmword")==0;
+}
+static void strip_hint_prefix(char *s) {
+    if (!s) return;
+    char *sp = s;
+    while (*sp && *sp != ' ' && *sp != '\t') sp++;
+    if (!*sp) return;
+    char save = *sp; *sp = '\0';
+    if (!is_size_hint_word(s)) { *sp = save; return; }
+    char *rest = sp + 1;
+    while (*rest == ' ' || *rest == '\t') rest++;
+    memmove(s, rest, strlen(rest) + 1);
+}
+static void strip_size_hint_arg(char **a1, char **a2, char **a3) {
+    strip_hint_prefix(*a1);
+    strip_hint_prefix(*a2);
+    strip_hint_prefix(*a3);
+    if (is_size_hint_word(*a2) && *a3) { *a2 = *a3; *a3 = NULL; }
+    if (is_size_hint_word(*a1) && *a2) { *a1 = *a2; *a2 = *a3; *a3 = NULL; }
 }
 
 void assemble_line(char *line) {
@@ -1308,63 +1353,67 @@ void assemble_line(char *line) {
         int idx = get_symbol(op);
         if (idx < 0) return;
         if (current_section == 0) {
-            /* Text label: store code offset; will be fixed up to VA in write_elf */
             symbols[idx].value = code_size;
         } else {
-            /* Data/rodata label: store data offset with high bit set to mark as data */
             symbols[idx].value = data_size | 0x80000000u;
         }
         symbols[idx].defined = 1;
+        /* If there is more on this line (e.g. "label: .byte 1"), process it */
+        if (arg1) {
+            /* Rebuild a line from arg1 onward and re-assemble it */
+            char rest_line[MAX_LINE];
+            if (arg2 && arg3)
+                snprintf(rest_line, MAX_LINE, "%s %s %s", arg1, arg2, arg3);
+            else if (arg2)
+                snprintf(rest_line, MAX_LINE, "%s %s", arg1, arg2);
+            else
+                snprintf(rest_line, MAX_LINE, "%s", arg1);
+            assemble_line(rest_line);
+        }
         return;
     }
     
     int32_t imm;
     int r1, r2;
-    
+
+    /* Strip Intel size hints embedded in operand strings or as separate tokens */
+    strip_size_hint_arg(&arg1, &arg2, &arg3);
+
     if (strcasecmp(op, "mov") == 0 && arg1 && arg2) {
         r1 = parse_reg(arg1);
         MemOperand mem;
-        
-        if (parse_imm(arg2, &imm)) {
+
+        if (r1 != -1 && parse_imm(arg2, &imm)) {
+            /* MOV reg, imm */
             if (is_64bit_reg(arg1)) {
                 emit_rex_w(needs_rex(arg1) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
                 emit_byte(0xb8 + (r1 & 7));
                 emit_qword(imm);
             } else {
-                emit_byte(0xb8 + r1);
+                emit_byte(0xb8 + (r1 & 7));
                 emit_dword(imm);
             }
-        } else if ((r2 = parse_reg(arg2)) != -1) {
-            /* MOV r/m, r  (0x89): reg=src(r2), r/m=dst(r1)
-               REX.R extends src(r2), REX.B extends dst(r1) */
-            if (is_64bit_reg(arg1) || is_64bit_reg(arg2) || needs_rex(arg1) || needs_rex(arg2)) {
-                emit_rex(is_64bit_reg(arg1) || is_64bit_reg(arg2) ? 1 : 0,
-                         needs_rex(arg2) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
-                emit_byte(0x89);
-                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
-            } else {
-                emit_byte(0x89);
-                emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
-            }
-        } else if (parse_mem_operand(arg2, &mem)) {
-            if (is_64bit_reg(arg1) || needs_rex(arg1)) {
-                emit_rex(is_64bit_reg(arg1) ? 1 : 0, 0, 0, needs_rex(arg1) ? 1 : 0);
-            }
-            emit_byte(0x8b);
-            emit_mem_operand(&mem, r1);
-        } else if ((r1 = parse_reg(arg1)) != -1 && parse_mem_operand(arg2, &mem)) {
-            if (is_64bit_reg(arg1) || needs_rex(arg1)) {
-                emit_rex(is_64bit_reg(arg1) ? 1 : 0, 0, 0, needs_rex(arg1) ? 1 : 0);
-            }
+        } else if (r1 != -1 && (r2 = parse_reg(arg2)) != -1) {
+            /* MOV r/m, r  (0x89): reg=src(r2), r/m=dst(r1) */
+            if (is_64bit_reg(arg1) || is_64bit_reg(arg2) || needs_rex(arg1) || needs_rex(arg2))
+                emit_rex(is_64bit_reg(arg1)||is_64bit_reg(arg2)?1:0,
+                         needs_rex(arg2)?1:0, 0, needs_rex(arg1)?1:0);
+            emit_byte(0x89);
+            emit_byte(0xc0 + ((r2 & 7) << 3) + (r1 & 7));
+        } else if (r1 != -1 && parse_mem_operand(arg2, &mem)) {
+            /* MOV reg, [mem]  (0x8B) */
+            if (is_64bit_reg(arg1) || needs_rex(arg1))
+                emit_rex(is_64bit_reg(arg1)?1:0, needs_rex(arg1)?1:0, 0, 0);
             emit_byte(0x8b);
             emit_mem_operand(&mem, r1);
         } else if (parse_mem_operand(arg1, &mem) && (r2 = parse_reg(arg2)) != -1) {
-            if (needs_rex(arg2)) {
-                emit_rex(0, 0, 0, needs_rex(arg2) ? 1 : 0);
-            }
+            /* MOV [mem], reg  (0x89) */
+            if (is_64bit_reg(arg2) || needs_rex(arg2))
+                emit_rex(is_64bit_reg(arg2)?1:0, needs_rex(arg2)?1:0, 0, 0);
             emit_byte(0x89);
             emit_mem_operand(&mem, r2);
         } else if (parse_mem_operand(arg1, &mem) && parse_imm(arg2, &imm)) {
+            /* MOV [mem], imm  (C7 /0) — 32-bit immediate sign-extended */
             emit_byte(0xc7);
             emit_mem_operand(&mem, 0);
             emit_dword(imm);
@@ -1709,13 +1758,34 @@ void assemble_line(char *line) {
     }
     else if (strcasecmp(op, "imul") == 0 && arg1) {
         r1 = parse_reg(arg1);
-        if (is_64bit_reg(arg1) || needs_rex(arg1)) {
-            emit_rex(is_64bit_reg(arg1) ? 1 : 0, 0, 0, needs_rex(arg1) ? 1 : 0);
-            emit_byte(0xf7);
-            emit_byte(0xe8 + (r1 & 7));
+        if (arg2 && arg3 && (r2 = parse_reg(arg2)) != -1
+                   && parse_imm(arg3, &imm)) {
+            /* Three-operand: imul dst, src, imm  (6B /r imm8 or 69 /r imm32) */
+            if (is_64bit_reg(arg1)||is_64bit_reg(arg2)||needs_rex(arg1)||needs_rex(arg2))
+                emit_rex(is_64bit_reg(arg1)||is_64bit_reg(arg2)?1:0,
+                         needs_rex(arg1)?1:0, 0, needs_rex(arg2)?1:0);
+            if (imm >= -128 && imm <= 127) {
+                emit_byte(0x6b);
+                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_byte((int8_t)imm);
+            } else {
+                emit_byte(0x69);
+                emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+                emit_dword(imm);
+            }
+        } else if (arg2 && (r2 = parse_reg(arg2)) != -1) {
+            /* Two-operand: imul dst, src  ->  0F AF /r
+               REX.R extends dst (r1), REX.B extends src (r2) */
+            if (is_64bit_reg(arg1)||is_64bit_reg(arg2)||needs_rex(arg1)||needs_rex(arg2))
+                emit_rex(is_64bit_reg(arg1)||is_64bit_reg(arg2)?1:0,
+                         needs_rex(arg1)?1:0, 0, needs_rex(arg2)?1:0);
+            emit_byte(0x0f); emit_byte(0xaf);
+            emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
         } else {
-            emit_byte(0xf7);
-            emit_byte(0xe8 + r1);
+            /* One-operand: imul src  ->  F7 /5  (rdx:rax = rax * src) */
+            if (is_64bit_reg(arg1) || needs_rex(arg1))
+                emit_rex(is_64bit_reg(arg1)?1:0, 0, 0, needs_rex(arg1)?1:0);
+            emit_byte(0xf7); emit_byte(0xe8 + (r1 & 7));
         }
     }
     else if (strcasecmp(op, "div") == 0 && arg1) {
@@ -2454,14 +2524,38 @@ void assemble_line(char *line) {
     else if (strcasecmp(op, "movsx") == 0 && arg1 && arg2) {
         r1 = parse_reg(arg1);
         r2 = parse_reg(arg2);
-        emit_byte(0x0f); emit_byte(0xbf);
-        emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+        MemOperand mem2;
+        if (r2 != -1) {
+            /* reg <- reg */
+            if (is_64bit_reg(arg1) || needs_rex(arg1) || needs_rex(arg2))
+                emit_rex(is_64bit_reg(arg1)?1:0, needs_rex(arg1)?1:0, 0, needs_rex(arg2)?1:0);
+            emit_byte(0x0f); emit_byte(0xbf);
+            emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+        } else if (parse_mem_operand(arg2, &mem2)) {
+            /* reg <- mem */
+            if (is_64bit_reg(arg1) || needs_rex(arg1))
+                emit_rex(is_64bit_reg(arg1)?1:0, needs_rex(arg1)?1:0, 0, 0);
+            emit_byte(0x0f); emit_byte(0xbf);
+            emit_mem_operand(&mem2, r1);
+        }
     }
     else if (strcasecmp(op, "movzx") == 0 && arg1 && arg2) {
         r1 = parse_reg(arg1);
         r2 = parse_reg(arg2);
-        emit_byte(0x0f); emit_byte(0xb6);
-        emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+        MemOperand mem2;
+        if (r2 != -1) {
+            /* reg <- reg */
+            if (is_64bit_reg(arg1) || needs_rex(arg1) || needs_rex(arg2))
+                emit_rex(is_64bit_reg(arg1)?1:0, needs_rex(arg1)?1:0, 0, needs_rex(arg2)?1:0);
+            emit_byte(0x0f); emit_byte(0xb6);
+            emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+        } else if (parse_mem_operand(arg2, &mem2)) {
+            /* reg <- mem (zero-extend byte) */
+            if (is_64bit_reg(arg1) || needs_rex(arg1))
+                emit_rex(is_64bit_reg(arg1)?1:0, needs_rex(arg1)?1:0, 0, 0);
+            emit_byte(0x0f); emit_byte(0xb6);
+            emit_mem_operand(&mem2, r1);
+        }
     }
     else if (strcasecmp(op, "cmpxchg8b") == 0 && arg1) {
         r1 = parse_reg(arg1);
