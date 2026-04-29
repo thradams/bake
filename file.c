@@ -1,4 +1,6 @@
-void puts(char* s);
+int printf(char* fmt, ...);
 int main(){
-   puts("abc");
+   int i;
+   for (i = 0; i < 10; i++)
+     printf("%d ", i);
 }

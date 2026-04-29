@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 #define MAX_LINE 512
 #define MAX_SYMBOLS 200
@@ -66,6 +67,7 @@ void assemble_line(char *line);
 void resolve_relocs(void);
 void write_elf(const char *filename);
 void write_obj(const char *filename);
+void write_dynelf(const char *filename);
 static uint32_t elf_text_va(void);
 static uint32_t elf_data_va(void);
 
@@ -1030,15 +1032,18 @@ void assemble_line(char *line) {
     if (rest) {
         /* skip leading whitespace */
         while (*rest == ' ' || *rest == '\t') rest++;
-        /* find first top-level comma */
-        int depth = 0;
+        /* find first top-level comma (respecting brackets AND quotes) */
+        int depth = 0; int inquote = 0;
         char *p = rest, *comma1 = NULL, *comma2 = NULL;
         while (*p) {
-            if (*p == '[' || *p == '(') depth++;
-            else if (*p == ']' || *p == ')') depth--;
-            else if (*p == ',' && depth == 0) {
-                if (!comma1) comma1 = p;
-                else if (!comma2) { comma2 = p; break; }
+            if (*p == '"' && depth == 0) inquote = !inquote;
+            else if (!inquote) {
+                if (*p == '[' || *p == '(') depth++;
+                else if (*p == ']' || *p == ')') depth--;
+                else if (*p == ',' && depth == 0) {
+                    if (!comma1) comma1 = p;
+                    else if (!comma2) { comma2 = p; break; }
+                }
             }
             p++;
         }
@@ -1079,9 +1084,13 @@ void assemble_line(char *line) {
             while (e > _a1 && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\n'||e[-1]=='\r')) *--e='\0';
             if (_a1[0]) {
                 arg1 = _a1;
-                /* find first space after arg1 */
+                /* find first space after arg1, respecting quotes */
                 char *sp = _a1;
-                while (*sp && *sp!=' ' && *sp!='\t') sp++;
+                int sq = 0;
+                while (*sp && (*sp != ' ' && *sp != '\t' || sq)) {
+                    if (*sp == '"') sq = !sq;
+                    sp++;
+                }
                 if (*sp) {
                     *sp++ = '\0';
                     while (*sp==' '||*sp=='\t') sp++;
@@ -1091,9 +1100,13 @@ void assemble_line(char *line) {
                         while (e>_a2&&(e[-1]==' '||e[-1]=='\t'||e[-1]=='\n'||e[-1]=='\r')) *--e='\0';
                         if (_a2[0]) {
                             arg2 = _a2;
-                            /* find second space for arg3 */
+                            /* find second space for arg3, respecting quotes */
                             char *sp2 = _a2;
-                            while (*sp2 && *sp2!=' ' && *sp2!='\t') sp2++;
+                            int sq2 = 0;
+                            while (*sp2 && (*sp2 != ' ' && *sp2 != '\t' || sq2)) {
+                                if (*sp2 == '"') sq2 = !sq2;
+                                sp2++;
+                            }
                             if (*sp2) {
                                 *sp2++ = '\0';
                                 while (*sp2==' '||*sp2=='\t') sp2++;
@@ -2983,35 +2996,440 @@ void write_obj(const char *filename) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        printf("Usage: %s <input.asm> <output> [obj|exe]\n", argv[0]);
+        printf("Usage: %s <input.asm> <o> [exe|dyn|obj]\n", argv[0]);
+        printf("  dyn  -- dynamically linked (default; puts/printf/etc work)\n");
+        printf("  exe  -- static; external calls replaced with exit(127)\n");
+        printf("  obj  -- relocatable object\n");
         return 1;
     }
-    
     code = malloc(code_capacity);
     data = malloc(data_capacity);
-    
     FILE *f = fopen(argv[1], "r");
-    if (!f) {
-        printf("Cannot open %s\n", argv[1]);
-        free(code);
-        free(data);
-        return 1;
-    }
-    
+    if (!f) { perror(argv[1]); free(code); free(data); return 1; }
     char line[MAX_LINE];
-    while (fgets(line, MAX_LINE, f)) {
-        assemble_line(line);
-    }
+    while (fgets(line, MAX_LINE, f)) assemble_line(line);
     fclose(f);
-
-    if (argc > 3 && strcmp(argv[3], "obj") == 0) {
-        resolve_relocs();   /* obj has no stub injection */
+    const char *mode = (argc > 3) ? argv[3] : "dyn";
+    if (strcmp(mode, "obj") == 0) {
+        resolve_relocs();
         write_obj(argv[2]);
+    } else if (strcmp(mode, "exe") == 0) {
+        write_elf(argv[2]);
     } else {
-        write_elf(argv[2]); /* write_elf calls resolve_relocs internally */
+        write_dynelf(argv[2]);
     }
-    
-    free(code);
-    free(data);
+    free(code); free(data);
     return 0;
+}
+    
+
+/* ================================================================
+ * write_dynelf — minimal dynamically-linked x86-64 ELF
+ *
+ * Generates an ET_EXEC ELF that has:
+ *   - PT_INTERP  -> /lib64/ld-linux-x86-64.so.2
+ *   - PT_DYNAMIC -> .dynamic section with DT_NEEDED libc.so.6
+ *   - PLT stubs  -> one 16-byte stub per external symbol
+ *   - .got.plt   -> lazy-binding GOT entries
+ *   - .rela.plt  -> R_X86_64_JUMP_SLOT relocations
+ *
+ * Page layout (all file offsets page-aligned):
+ *   0x0000  LOAD R   : ELF hdr + phdrs + .interp + .dynsym +
+ *                      .dynstr + .gnu.hash + .rela.plt
+ *   0x1000  LOAD R|X : .plt  (16 bytes per external + 16 for PLT[0])
+ *   0x2000  LOAD R|X : .text (user code, with _start stub)
+ *   0x3000  LOAD R   : .rodata / .data (user data)
+ *   0x4000  LOAD R|W : .got.plt + .dynamic
+ *
+ * All VAs are BASE + page_offset (BASE = 0x400000).
+ * ================================================================ */
+
+/* helpers */
+typedef struct { char name[64]; } DynSym;
+static DynSym  dyn_syms[256];
+static int     dyn_sym_count;
+
+static int dyn_find_or_add(const char *nm) {
+    for (int i=0;i<dyn_sym_count;i++)
+        if(strcmp(dyn_syms[i].name,nm)==0) return i;
+    if(dyn_sym_count<256){
+        strncpy(dyn_syms[dyn_sym_count].name,nm,63);
+        dyn_syms[dyn_sym_count].name[63]='\0';
+        return dyn_sym_count++;
+    }
+    return -1;
+}
+static void we64(FILE*f,uint64_t v){uint8_t b[8];memcpy(b,&v,8);fwrite(b,1,8,f);}
+static void we32(FILE*f,uint32_t v){uint8_t b[4];memcpy(b,&v,4);fwrite(b,1,4,f);}
+static void we16(FILE*f,uint16_t v){uint8_t b[2];memcpy(b,&v,2);fwrite(b,1,2,f);}
+static void we_pad(FILE*f,long target){
+    long c=ftell(f); while(c<target){fputc(0,f);c++;}
+}
+
+void write_dynelf(const char *filename) {
+
+    /* ---- 1. Inject _start stub if user only defines main ----------- */
+    /* _start stub matching gcc's CRT startup for glibc.
+     * Calling convention: __libc_start_main(main,argc,argv,init,fini,rtld_fini,stack_end)
+     * rdi=main  rsi=argc  rdx=argv  rcx=init(0)  r8=fini(0)  r9=rtld_fini(0)
+     * [rsp+8]=stack_end (pushed before the call) */
+    static const uint8_t STUB[] = {
+        0xf3,0x0f,0x1e,0xfa,        /* endbr64                          */
+        0x31,0xed,                   /* xor  ebp, ebp                    */
+        0x49,0x89,0xd1,              /* mov  r9,  rdx  (rtld_fini)       */
+        0x5e,                        /* pop  rsi       (argc)            */
+        0x48,0x89,0xe2,              /* mov  rdx, rsp  (argv)            */
+        0x48,0x83,0xe4,0xf0,        /* and  rsp, -16  (align stack)     */
+        0x50,                        /* push rax       (scratch pad)     */
+        0x54,                        /* push rsp       (stack_end arg)   */
+        0x45,0x31,0xc0,              /* xor  r8d, r8d  (fini = 0)       */
+        0x31,0xc9,                   /* xor  ecx, ecx  (init = 0)       */
+        0x48,0x8d,0x3d,0,0,0,0,     /* lea  rdi,[rip+?] (main)         */
+        0xe8,0,0,0,0,                /* call __libc_start_main@PLT      */
+        0xf4                         /* hlt                              */
+    };
+    const uint32_t STUB_SZ = sizeof(STUB);
+    const uint32_t STUB_LEA_DISP  = 27;  /* disp32 for lea rdi,[rip+?] */
+    const uint32_t STUB_CALL_DISP = 32;  /* disp32 for call            */
+    {
+        int mi=get_symbol("main"), si2=get_symbol("_start");
+        int hm=(mi>=0&&symbols[mi].defined);
+        int hs=(si2>=0&&symbols[si2].defined);
+        if(hm&&!hs){
+            for(int i=0;i<sym_count;i++)
+                if(symbols[i].defined&&!(symbols[i].value&0x80000000u))
+                    symbols[i].value+=STUB_SZ;
+            for(int i=0;i<reloc_count;i++)
+                if((relocs[i].type>>8)==0) relocs[i].offset+=STUB_SZ;
+            uint32_t ns=code_size+STUB_SZ;
+            if(ns>code_capacity){
+                while(code_capacity<ns) code_capacity*=2;
+                uint8_t*t=realloc(code,code_capacity);
+                if(!t){fprintf(stderr,"OOM\n");return;}
+                code=t;
+            }
+            memmove(code+STUB_SZ,code,code_size);
+            memcpy(code,STUB,STUB_SZ);
+            code_size=ns;
+            /* Patch the two displacements in the new glibc-compatible stub.
+             * TEXT_VA for dynelf is always 0x402000. */
+            const uint64_t TEXT_VA_STUB = 0x402000ULL;
+            /* Patch lea rdi, [rip+?] -> main */
+            int mi2=get_symbol("main");
+            if(mi2>=0&&symbols[mi2].defined){
+                uint32_t lea_next=(uint32_t)(TEXT_VA_STUB+STUB_LEA_DISP+4);
+                uint32_t main_va =(uint32_t)(TEXT_VA_STUB+symbols[mi2].value);
+                int32_t ld=(int32_t)(main_va-lea_next);
+                memcpy(code+STUB_LEA_DISP,&ld,4);
+            }
+            /* Add reloc for call __libc_start_main@PLT */
+            if(reloc_count<MAX_RELOCS){
+                relocs[reloc_count].offset=STUB_CALL_DISP;
+                strncpy(relocs[reloc_count].symbol,"__libc_start_main",
+                        sizeof(relocs[reloc_count].symbol)-1);
+                relocs[reloc_count].symbol[sizeof(relocs[reloc_count].symbol)-1]='\0';
+                relocs[reloc_count].type=1; /* rel32, text section */
+                reloc_count++;
+            }
+        }
+    }
+
+    /* ---- 2. Collect all external symbols (AFTER stub injection so
+     *          __libc_start_main reloc is included) ------------------- */
+    dyn_sym_count = 0;
+    for(int i=0;i<reloc_count;i++){
+        int si=get_symbol(relocs[i].symbol);
+        if(si<0||!symbols[si].defined)
+            dyn_find_or_add(relocs[i].symbol);
+    }
+    int next = dyn_sym_count;   /* number of PLT entries */
+
+    /* ---- 3. Fixed layout ------------------------------------------- */
+    const uint64_t BASE = 0x400000ULL;
+    const uint64_t PAGE = 0x1000ULL;
+
+    /* page 0: headers + dyn metadata */
+    const uint64_t P0_VA  = BASE + 0*PAGE;
+    /* page 1: PLT */
+    const uint64_t PLT_VA = BASE + 1*PAGE;
+    const uint64_t PLT_OFF= 1*PAGE;
+    const uint32_t PLT_SZ = (uint32_t)(16*(next+1));
+    /* page 2: .text */
+    const uint64_t TEXT_VA = BASE + 2*PAGE;
+    const uint64_t TEXT_OFF= 2*PAGE;
+    /* page 3: .data */
+    const uint64_t DATA_VA = BASE + 3*PAGE;
+    const uint64_t DATA_OFF= 3*PAGE;
+    /* page 4: .got.plt + .dynamic (RW) */
+    const uint64_t RW_VA  = BASE + 4*PAGE;
+    const uint64_t RW_OFF = 4*PAGE;
+
+    /* GOT layout: [0]=&_DYNAMIC [1]=0 [2]=0 [3..next+2]=PLT push addr */
+    const uint64_t GOT_VA  = RW_VA;
+    const uint32_t GOT_SZ  = (uint32_t)(8*(next+3));
+    /* .dynamic right after GOT */
+    const uint64_t DYN_VA  = RW_VA + GOT_SZ;
+    const uint64_t DYN_OFF = RW_OFF + GOT_SZ;
+    /* 12 dynamic entries */
+    const uint32_t DYN_SZ  = 16*15;  /* 15 dynamic entries (incl. DT_NULL) */
+    const uint64_t RW_SZ   = GOT_SZ + DYN_SZ;
+
+    /* page 0 sub-layout */
+    /* interp at fixed offset */
+    const char    *INTERP    = "/lib64/ld-linux-x86-64.so.2";
+    const uint32_t INTERP_SZ = (uint32_t)strlen(INTERP)+1;
+    const uint64_t INTERP_OFF= 0x200;
+    const uint64_t INTERP_VA = P0_VA + INTERP_OFF;
+
+    /* .gnu.hash right after interp (8-byte aligned) */
+    uint64_t gnuhash_off = (INTERP_OFF+INTERP_SZ+7)&~7ULL;
+    uint64_t gnuhash_va  = P0_VA+gnuhash_off;
+    /* minimal valid gnu hash: nbuckets=1,symndx=1,bloom_sz=1,shift=0,
+       bloom=0xFFFFFFFFFFFFFFFF (all 1s = accept all), bucket=1, no chains */
+    const uint32_t GNUHASH_SZ = 4+4+4+4+8+4; /* = 28 bytes */
+
+    /* .dynsym (24 bytes per entry, 8-byte aligned) */
+    uint64_t dynsym_off = (gnuhash_off+GNUHASH_SZ+7)&~7ULL;
+    uint64_t dynsym_va  = P0_VA+dynsym_off;
+    uint32_t dynsym_sz  = (uint32_t)(24*(next+1)); /* null + next entries */
+
+    /* .dynstr */
+    uint32_t dstr_idx[256]={0};
+    char     dstr[4096]; uint32_t dstr_len=1; dstr[0]='\0';
+    for(int i=0;i<next;i++){
+        dstr_idx[i]=dstr_len;
+        uint32_t nl=(uint32_t)strlen(dyn_syms[i].name)+1;
+        memcpy(dstr+dstr_len,dyn_syms[i].name,nl);
+        dstr_len+=nl;
+    }
+    uint32_t libc_off=dstr_len;
+    memcpy(dstr+dstr_len,"libc.so.6",10); dstr_len+=10;
+
+    uint64_t dynstr_off=(dynsym_off+dynsym_sz+7)&~7ULL;
+    uint64_t dynstr_va =P0_VA+dynstr_off;
+
+    /* .rela.plt (24 bytes per entry, 8-byte aligned) */
+    uint64_t rela_off=(dynstr_off+dstr_len+7)&~7ULL;
+    uint64_t rela_va =P0_VA+rela_off;
+    uint32_t rela_sz =(uint32_t)(24*next);
+
+    uint64_t p0_sz = rela_off+rela_sz;
+
+    /* ---- 4. Resolve relocs ----------------------------------------- */
+    for(int i=0;i<reloc_count;i++){
+        int si=get_symbol(relocs[i].symbol);
+        int sec=relocs[i].type>>8;
+        uint32_t off=relocs[i].offset;
+        if(si>=0&&symbols[si].defined){
+            uint64_t sv=(symbols[si].value&0x80000000u)
+                ? DATA_VA+(symbols[si].value&~0x80000000u)
+                : TEXT_VA+symbols[si].value;
+            if(sec==0&&off+4<=code_size){
+                int32_t r=(int32_t)(sv-(TEXT_VA+off+4));
+                memcpy(code+off,&r,4);
+            } else if(sec==1&&off+4<=data_size){
+                uint32_t v=(uint32_t)sv; memcpy(data+off,&v,4);
+            }
+        } else {
+            int ei=dyn_find_or_add(relocs[i].symbol);
+            if(ei>=0&&sec==0&&off+4<=code_size){
+                uint64_t plt_stub=PLT_VA+(uint64_t)((ei+1)*16);
+                int32_t r=(int32_t)(plt_stub-(TEXT_VA+off+4));
+                memcpy(code+off,&r,4);
+            }
+        }
+    }
+
+    /* ---- 5. Entry point -------------------------------------------- */
+    uint64_t entry;
+    {
+        int ei2=get_symbol("_start");
+        if(ei2<0||!symbols[ei2].defined) ei2=get_symbol("main");
+        /* _start stub is at TEXT_VA+0 when injected */
+        entry=(ei2>=0&&symbols[ei2].defined)
+            ? TEXT_VA+symbols[ei2].value : TEXT_VA;
+        /* if stub was injected, _start is at TEXT_VA+0 */
+        {
+            int mi3=get_symbol("_start");
+            if(mi3<0||!symbols[mi3].defined){
+                int mi4=get_symbol("main");
+                if(mi4>=0&&symbols[mi4].defined&&symbols[mi4].value>=STUB_SZ)
+                    entry=TEXT_VA; /* stub is prepended */
+                else if(mi4>=0&&symbols[mi4].defined)
+                    entry=TEXT_VA; /* stub at 0 */
+            }
+        }
+    }
+
+    /* ---- 6. Write file --------------------------------------------- */
+    FILE *f=fopen(filename,"wb");
+    if(!f){perror(filename);return;}
+
+    /* ELF header (64 bytes) */
+    {
+        uint8_t mg[16]={0x7f,'E','L','F',2,1,1,0,0,0,0,0,0,0,0,0};
+        fwrite(mg,1,16,f);
+    }
+    we16(f,2);   /* ET_EXEC */
+    we16(f,62);  /* EM_X86_64 */
+    we32(f,1);   /* e_version */
+    we64(f,entry);
+    we64(f,64);  /* e_phoff */
+    we64(f,0);   /* e_shoff */
+    we32(f,0);   /* e_flags */
+    we16(f,64);  /* e_ehsize */
+    we16(f,56);  /* e_phentsize */
+    we16(f,7);   /* e_phnum: PHDR INTERP LOAD0 LOAD1 LOAD2 DYNAMIC GNU_STACK */
+    we16(f,64);  /* e_shentsize */
+    we16(f,0);   /* e_shnum */
+    we16(f,0);   /* e_shstrndx */
+
+    /* Program headers (6 × 56 = 336 bytes) */
+    /* PHDR */
+    we32(f,6);we32(f,4);we64(f,64);we64(f,P0_VA+64);we64(f,P0_VA+64);
+    we64(f,7*56);we64(f,7*56);we64(f,8);
+    /* INTERP */
+    we32(f,3);we32(f,4);
+    we64(f,INTERP_OFF);we64(f,INTERP_VA);we64(f,INTERP_VA);
+    we64(f,INTERP_SZ);we64(f,INTERP_SZ);we64(f,1);
+    /* LOAD0: R (headers + dyn metadata) */
+    we32(f,1);we32(f,4);
+    we64(f,0);we64(f,P0_VA);we64(f,P0_VA);
+    we64(f,p0_sz);we64(f,p0_sz);we64(f,PAGE);
+    /* LOAD1: R|X — PLT (page 1) + .text (page 2), two pages total */
+    we32(f,1);we32(f,5);
+    we64(f,PLT_OFF);we64(f,PLT_VA);we64(f,PLT_VA);
+    we64(f,PAGE+(uint64_t)code_size);   /* PLT page + text bytes */
+    we64(f,PAGE+(uint64_t)code_size);
+    we64(f,PAGE);
+    /* LOAD2: R|W (data + got + dynamic) */
+    we32(f,1);we32(f,6);
+    we64(f,DATA_OFF);we64(f,DATA_VA);we64(f,DATA_VA);
+    we64(f,(uint64_t)data_size+PAGE+RW_SZ);
+    we64(f,(uint64_t)data_size+PAGE+RW_SZ);
+    we64(f,PAGE);
+    /* DYNAMIC */
+    we32(f,2);we32(f,6);
+    we64(f,DYN_OFF);we64(f,DYN_VA);we64(f,DYN_VA);
+    we64(f,DYN_SZ);we64(f,DYN_SZ);we64(f,8);
+    /* PT_GNU_STACK: tells kernel stack is RW (not exec), required by glibc */
+    we32(f,0x6474e551);we32(f,6);   /* PT_GNU_STACK, PF_R|PF_W */
+    we64(f,0);we64(f,0);we64(f,0);  /* offset, vaddr, paddr = 0 */
+    we64(f,0);we64(f,0);            /* filesz, memsz = 0 */
+    we64(f,0x10);                   /* align = 16 */
+
+    /* Page 0 content */
+    we_pad(f,INTERP_OFF);
+    fwrite(INTERP,1,INTERP_SZ,f);
+
+    /* .gnu.hash — we export zero symbols, all dynsym entries are SHN_UNDEF.
+     * Use symndx=1 (start of dynsym table), bloom=0, bucket=0, no chains.
+     * This exactly matches what gcc generates for a no-export shared object. */
+    we_pad(f,gnuhash_off);
+    we32(f,1);   /* nbuckets */
+    we32(f,1);   /* symndx = 1 (all entries before this are local/undef) */
+    we32(f,1);   /* bloom_size */
+    we32(f,0);   /* bloom_shift */
+    we64(f,0);   /* bloom[0] = 0: no exported symbols */
+    we32(f,0);   /* bucket[0] = 0: no chains */
+    /* no chain entries */
+
+    /* .dynsym */
+    we_pad(f,dynsym_off);
+    /* null sym */
+    for(int j=0;j<24;j++) fputc(0,f);
+    for(int i=0;i<next;i++){
+        we32(f,dstr_idx[i]);        /* st_name */
+        fputc(0x12,f);               /* st_info = STB_GLOBAL|STT_FUNC */
+        fputc(0,f);                  /* st_other */
+        we16(f,0);                   /* st_shndx = SHN_UNDEF */
+        we64(f,0);                   /* st_value */
+        we64(f,0);                   /* st_size */
+    }
+
+    /* .dynstr */
+    we_pad(f,dynstr_off);
+    fwrite(dstr,1,dstr_len,f);
+
+    /* .rela.plt */
+    we_pad(f,rela_off);
+    for(int i=0;i<next;i++){
+        uint64_t got_slot=GOT_VA+(uint64_t)((i+3)*8);
+        we64(f,got_slot);
+        we64(f,((uint64_t)(i+1)<<32)|7ULL); /* R_X86_64_JUMP_SLOT */
+        we64(f,0);
+    }
+
+    /* PLT[0]: lazy resolver
+       ff 35 <disp>   push [GOT+8]
+       ff 25 <disp>   jmp  [GOT+16]
+       0f 1f 40 00    nop  */
+    we_pad(f,PLT_OFF);
+    {
+        uint64_t plt0=PLT_VA;
+        int32_t dp=(int32_t)((GOT_VA+8)-(plt0+6));
+        int32_t dj=(int32_t)((GOT_VA+16)-(plt0+12));
+        fputc(0xff,f);fputc(0x35,f);we32(f,(uint32_t)dp);
+        fputc(0xff,f);fputc(0x25,f);we32(f,(uint32_t)dj);
+        fputc(0x0f,f);fputc(0x1f,f);fputc(0x40,f);fputc(0x00,f);
+    }
+    /* PLT[i+1]: per-symbol stub
+       ff 25 <disp>   jmp *[GOT[i+3]]
+       68 <imm32>     push i
+       e9 <disp>      jmp PLT[0]
+       90             nop */
+    for(int i=0;i<next;i++){
+        uint64_t sv2=PLT_VA+(uint64_t)((i+1)*16);
+        uint64_t gs =GOT_VA+(uint64_t)((i+3)*8);
+        int32_t dg=(int32_t)(gs-(sv2+6));
+        int32_t dp2=(int32_t)(PLT_VA-(sv2+16));
+        fputc(0xff,f);fputc(0x25,f);we32(f,(uint32_t)dg);  /* 6 bytes */
+        fputc(0x68,f);we32(f,(uint32_t)i);                   /* 5 bytes */
+        fputc(0xe9,f);we32(f,(uint32_t)dp2);                 /* 5 bytes = 16 total */
+    }
+
+    /* .text */
+    we_pad(f,TEXT_OFF);
+    fwrite(code,1,code_size,f);
+
+    /* .data */
+    we_pad(f,DATA_OFF);
+    if(data_size>0) fwrite(data,1,data_size,f);
+
+    /* .got.plt */
+    we_pad(f,RW_OFF);
+    we64(f,DYN_VA);    /* GOT[0] = &_DYNAMIC */
+    we64(f,0);          /* GOT[1] = 0 (filled by ld.so) */
+    we64(f,0);          /* GOT[2] = 0 (filled by ld.so) */
+    for(int i=0;i<next;i++){
+        /* initially points to PLT[i+1]+6 = the push instruction */
+        we64(f,PLT_VA+(uint64_t)((i+1)*16+6));
+    }
+
+    /* .dynamic — layout matching what ld(1) generates */
+    we_pad(f,DYN_OFF);
+    we64(f,1);              we64(f,libc_off);    /* DT_NEEDED libc.so.6 */
+    we64(f,5);              we64(f,dynstr_va);   /* DT_STRTAB */
+    we64(f,6);              we64(f,dynsym_va);   /* DT_SYMTAB */
+    we64(f,10);             we64(f,dstr_len);    /* DT_STRSZ */
+    we64(f,11);             we64(f,24);          /* DT_SYMENT */
+    we64(f,3);              we64(f,GOT_VA);      /* DT_PLTGOT */
+    we64(f,7);              we64(f,rela_va);     /* DT_RELA */
+    we64(f,8);              we64(f,rela_sz);     /* DT_RELASZ */
+    we64(f,9);              we64(f,24);          /* DT_RELAENT */
+    we64(f,2);              we64(f,rela_sz);     /* DT_PLTRELSZ */
+    we64(f,20);             we64(f,7);           /* DT_PLTREL = RELA */
+    we64(f,23);             we64(f,rela_va);     /* DT_JMPREL */
+    we64(f,0x6ffffef5ULL);  we64(f,gnuhash_va); /* DT_GNU_HASH */
+    we64(f,21);             we64(f,0);           /* DT_DEBUG */
+    we64(f,0);              we64(f,0);           /* DT_NULL */
+
+    fclose(f);
+    chmod(filename,0755);
+
+    if(next>0){
+        fprintf(stderr,"info: dynamically linked %d symbol(s):",next);
+        for(int i=0;i<next;i++) fprintf(stderr," %s",dyn_syms[i].name);
+        fprintf(stderr,"\n");
+    }
 }
