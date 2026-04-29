@@ -1,4 +1,4 @@
-# Vibe coding C compiler
+# Vibe coding C compiler & Linker Assembler
 
 This is a simplified C89 compiler
 
