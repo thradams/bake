@@ -1,4 +1,4 @@
-# bake — A Small C Compiler
+# bake — A Small C Compiler 100% vibe coding
 
 A single-pass C compiler that supports multiple backends. The frontend parses and resolves a substantial subset of C; backends emit x86-64 AT&T assembly or WebAssembly Text Format (WAT).
 
