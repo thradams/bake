@@ -1,6 +1,6 @@
-int printf(char* fmt, ...);
+int puts(char* fmt);
 int main(){
    int i;
    for (i = 0; i < 10; i++)
-     printf("%d ", i);
+     puts("a ");
 }

@@ -1401,3 +1401,4 @@ void gen_gvar(struct Node *gv) {
         emit("  .zero %d", type_size(gv->type));
     }
 }
+

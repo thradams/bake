@@ -216,3 +216,9 @@ extern FILE *out;
 void gen_func(struct Node *fn);
 void gen_gvar(struct Node *gv);
 void emit(const char *fmt, ...) __attribute__((format(printf,1,2)));
+
+/* ------------------------------------------------------------------ */
+/* Wasm-specific hooks (only in codegen_wasm.c / bake_wasm binary)    */
+/* ------------------------------------------------------------------ */
+void wasm_emit_module_open(struct Node *program);
+void wasm_emit_module_close(struct Node *program);
