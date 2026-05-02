@@ -1367,33 +1367,156 @@ void gen_func(struct Node *fn) {
     emit("  ret");
 }
 
+/* ------------------------------------------------------------------ */
+/* Static initializer emission helpers                                  */
+/* ------------------------------------------------------------------ */
+
+/* Emit bytes for a single scalar constant of the given type. */
+static void emit_scalar_init(struct Node *val, struct Type *type) {
+    int sz = type_size(type);
+    if (!val) {
+        emit("  .zero %d", sz);
+        return;
+    }
+    if (val->kind == ND_FLOAT || (val->kind == ND_CAST && is_float_type(val->type))) {
+        double fv = val->fval;
+        if (sz == 4) {
+            union { float f; uint32_t u; } u; u.f = (float)fv;
+            emit("  .long %u", u.u);
+        } else {
+            union { double d; uint64_t u; } u; u.d = fv;
+            emit("  .quad %llu", (unsigned long long)u.u);
+        }
+        return;
+    }
+    if (val->kind == ND_STR) {
+        /* pointer to string literal: emit label in .quad, string in .rodata */
+        emit("  .quad .LC_str_%p", (void*)val->sval);
+        emit("  .section .rodata");
+        emit(".LC_str_%p:", (void*)val->sval);
+        emit_string_literal(val->sval);
+        emit("  .data");
+        return;
+    }
+    long long iv = (val->kind == ND_INT) ? val->ival : 0;
+    switch (sz) {
+        case 1: emit("  .byte %lld",  iv); break;
+        case 2: emit("  .short %lld", iv); break;
+        case 4: emit("  .long %lld",  iv); break;
+        default:emit("  .quad %lld",  iv); break;
+    }
+}
+
+/* Forward declaration */
+static void emit_init(struct Node *init, struct Type *type);
+
+/* Emit an array initializer list into consecutive bytes. */
+static void emit_array_init(struct Node *list, struct Type *arr_type) {
+    int count   = arr_type->array_size;    /* 0 = unbounded (flexible) */
+    struct Type *et = arr_type->base;
+    int esz     = type_size(et);
+
+    /* Build a flat array of initializer pointers, indexed by position. */
+    /* Use a simple pass: walk the element list and fill by index.       */
+    /* Max 65536 elements for static data. */
+    int max_idx = 0;
+    for (struct Node *e = list ? list->stmts : NULL; e; e = e->next) {
+        int idx = (int)e->ival;   /* set by parser */
+        if (idx > max_idx) max_idx = idx;
+    }
+    int n_elems = (count > 0) ? count : max_idx + 1;
+
+    /* Allocate a zero-initialized pointer array in the arena */
+    struct Node **elems = arena_alloc(n_elems * sizeof(struct Node *));
+
+    for (struct Node *e = list ? list->stmts : NULL; e; e = e->next) {
+        int idx = (int)e->ival;
+        if (idx >= 0 && idx < n_elems)
+            elems[idx] = e->lhs;
+    }
+
+    for (int i = 0; i < n_elems; i++) {
+        if (elems[i])
+            emit_init(elems[i], et);
+        else
+            emit("  .zero %d", esz);
+    }
+}
+
+/* Emit a struct initializer list into consecutive member bytes. */
+static void emit_struct_init(struct Node *list, struct Type *st_type) {
+    int written = 0;   /* bytes emitted so far (for padding) */
+    struct Member *m = st_type->members;
+    struct Node   *e = list ? list->stmts : NULL;
+
+    for (; m; m = m->next) {
+        if (!m->name) continue;   /* unnamed padding member */
+
+        /* Emit padding before this member */
+        if (m->offset > written) {
+            emit("  .zero %d", m->offset - written);
+            written = m->offset;
+        }
+
+        /* Find the matching initializer element */
+        struct Node *val = NULL;
+        /* Designated: search by name */
+        for (struct Node *ie = list ? list->stmts : NULL; ie; ie = ie->next) {
+            if (ie->name && strcmp(ie->name, m->name) == 0) {
+                val = ie->lhs; break;
+            }
+        }
+        /* Sequential: use current e if it has no designator */
+        if (!val && e && !e->name && e->ival < 0) {
+            val = e->lhs;
+            e = e->next;
+        } else if (!val && e && !e->name) {
+            val = e->lhs;
+            e = e->next;
+        }
+
+        int msz = type_size(m->type);
+        if (val)
+            emit_init(val, m->type);
+        else
+            emit("  .zero %d", msz);
+        written += msz;
+    }
+
+    /* Trailing padding to struct total size */
+    int total = type_size(st_type);
+    if (total > written)
+        emit("  .zero %d", total - written);
+}
+
+/* Dispatch to the right emitter based on type. */
+static void emit_init(struct Node *init, struct Type *type) {
+    if (!init) { emit("  .zero %d", type_size(type)); return; }
+
+    if (init->kind == ND_INIT_LIST) {
+        if (type->kind == TY_ARRAY)
+            emit_array_init(init, type);
+        else if (type->kind == TY_STRUCT || type->kind == TY_UNION)
+            emit_struct_init(init, type);
+        else
+            /* brace around scalar: just use the first element */
+            emit_init(init->stmts ? init->stmts->lhs : NULL, type);
+        return;
+    }
+    /* scalar */
+    emit_scalar_init(init, type);
+}
+
+/* ------------------------------------------------------------------ */
+/* gen_gvar                                                             */
+/* ------------------------------------------------------------------ */
+
 void gen_gvar(struct Node *gv) {
     if (gv->init) {
         emit("  .data");
         emit("  .globl %s", gv->name);
         emit("%s:", gv->name);
-        int sz = type_size(gv->type);
-        if (gv->init->kind == ND_FLOAT) {
-            /* float or double literal initializer */
-            if (sz == 4) {
-                union { float f; uint32_t u; } u;
-                u.f = (float)gv->init->fval;
-                emit("  .long %u", u.u);
-            } else {
-                union { double d; uint64_t u; } u;
-                u.d = gv->init->fval;
-                emit("  .quad %llu", (unsigned long long)u.u);
-            }
-        } else if (gv->init->kind == ND_INT) {
-            switch (sz) {
-                case 1: emit("  .byte %lld",  gv->init->ival); break;
-                case 2: emit("  .short %lld", gv->init->ival); break;
-                case 4: emit("  .long %lld",  gv->init->ival); break;
-                default:emit("  .quad %lld",  gv->init->ival); break;
-            }
-        } else {
-            emit("  .zero %d", sz);
-        }
+        emit_init(gv->init, gv->type);
     } else {
         emit("  .bss");
         emit("  .globl %s", gv->name);

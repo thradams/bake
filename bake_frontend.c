@@ -544,6 +544,7 @@ static struct Node *parse_expr(void);
 static struct Node *parse_stmt(void);
 static struct Type *parse_type_spec(void);
 static struct Type *parse_declarator(struct Type *base, char **name_out);
+static struct Node *parse_initializer(struct Type *type);
 
 /* ------------------------------------------------------------------ */
 /* Parser -- types                                                      */
@@ -1119,7 +1120,7 @@ static struct Node *parse_stmt(void) {
         struct Node *n = new_node(ND_DECL);
         n->name = name;
         n->type = vtype;
-        if (match(TK_ASSIGN)) n->init = parse_expr();
+        if (match(TK_ASSIGN)) n->init = parse_initializer(vtype);
         expect(TK_SEMI, "expected ';' after declaration");
         return n;
     }
@@ -1144,6 +1145,85 @@ static struct Node *parse_block(void) {
     expect(TK_RBRACE, "expected '}'");
     block->stmts = head;
     return block;
+}
+
+/* ------------------------------------------------------------------ */
+/* Initializer parser                                                   */
+/* Handles scalar, array, and struct initializers recursively.          */
+/* Returns either a plain expr node (scalar) or ND_INIT_LIST.           */
+/* ------------------------------------------------------------------ */
+
+static struct Node *parse_initializer(struct Type *type) {
+    /* brace-enclosed: { ... } */
+    if (match(TK_LBRACE)) {
+        struct Node *list = new_node(ND_INIT_LIST);
+        list->type = type;
+        struct Node *head = NULL, *tail = NULL;
+        int seq_idx = 0;   /* sequential element counter */
+
+        while (!check(TK_RBRACE) && !check(TK_EOF)) {
+            struct Node *elem = new_node(ND_INIT_LIST);
+            elem->ival = -1;   /* default: sequential */
+            elem->name = NULL;
+
+            /* designated initializer: .field = value  (struct/union) */
+            if (check(TK_DOT)) {
+                advance();
+                struct Token *fname = expect(TK_IDENT, "expected field name after '.'");
+                elem->name = fname->sval;
+                expect(TK_ASSIGN, "expected '=' after designator");
+            }
+            /* designated initializer: [N] = value  (array) */
+            else if (check(TK_LBRACKET)) {
+                advance();
+                struct Node *idx_expr = parse_expr();
+                if (idx_expr->kind != ND_INT)
+                    die("array designator must be an integer constant");
+                elem->ival = idx_expr->ival;
+                seq_idx = (int)elem->ival;
+                expect(TK_RBRACKET, "expected ']' after array designator");
+                expect(TK_ASSIGN, "expected '=' after designator");
+            }
+
+            /* determine element type for nested init */
+            struct Type *elem_type = NULL;
+            if (type) {
+                if (type->kind == TY_ARRAY)
+                    elem_type = type->base;
+                else if ((type->kind == TY_STRUCT || type->kind == TY_UNION) && elem->name) {
+                    struct Member *m = NULL;
+                    for (struct Member *mb = type->members; mb; mb = mb->next)
+                        if (mb->name && strcmp(mb->name, elem->name) == 0) { m = mb; break; }
+                    if (m) elem_type = m->type;
+                }
+            }
+
+            /* recursively parse the value */
+            struct Node *val;
+            if (check(TK_LBRACE))
+                val = parse_initializer(elem_type);
+            else
+                val = parse_expr();
+
+            elem->lhs = val;
+            if (elem->ival < 0) elem->ival = seq_idx;
+            seq_idx++;
+
+            /* append element to list */
+            elem->next = NULL;
+            if (!head) head = tail = elem;
+            else { tail->next = elem; tail = elem; }
+
+            if (!match(TK_COMMA)) break;   /* allow trailing comma */
+        }
+
+        expect(TK_RBRACE, "expected '}' at end of initializer");
+        list->stmts = head;
+        return list;
+    }
+
+    /* scalar: just an expression */
+    return parse_expr();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1215,7 +1295,7 @@ struct Node *parse_program(void) {
             struct Node *gv = new_node(ND_GVAR);
             gv->name = name;
             gv->type = dtype;
-            if (match(TK_ASSIGN)) gv->init = parse_expr();
+            if (match(TK_ASSIGN)) gv->init = parse_initializer(dtype);
             expect(TK_SEMI, "expected ';' after global variable");
             gv->next = NULL;
             if (!head) head = tail = gv;

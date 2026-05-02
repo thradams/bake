@@ -111,6 +111,12 @@ enum NodeKind {
     ND_GVAR,
     ND_STRUCT_DEF,
     ND_PROTO,
+    /* Initializer list: { e, e, e } or { .field=e, [N]=e, ... }
+       stmts = linked list of initializer element nodes (chained via ->next)
+       Each element is either a scalar expr or a nested ND_INIT_LIST.
+       name  = designated field name (.field=) or NULL
+       ival  = designated array index ([N]=) or -1 for sequential        */
+    ND_INIT_LIST,
 };
 
 struct Node {
