@@ -1188,18 +1188,110 @@ void gen_func(struct Node *fn) {
 /* gen_gvar -- register a global variable and emit its initialiser     */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Serialise a static initializer into a byte buffer (for data segs)  */
+/* ------------------------------------------------------------------ */
+
+static void wasm_serial_init(struct Node *init, struct Type *type,
+                              unsigned char *buf, int buf_off, int buf_sz);
+
+static void wasm_serial_scalar(struct Node *val, struct Type *type,
+                                unsigned char *buf, int off) {
+    int sz = type_size(type);
+    if (!val) { /* zero already */ return; }
+    if (val->kind == ND_INT) {
+        long long v = val->ival;
+        for (int i = 0; i < sz; i++) buf[off+i] = (unsigned char)((v >> (8*i)) & 0xff);
+    } else if (val->kind == ND_FLOAT) {
+        if (sz == 4) {
+            union { float f; uint32_t u; } u; u.f = (float)val->fval;
+            for (int i = 0; i < 4; i++) buf[off+i] = (u.u >> (8*i)) & 0xff;
+        } else {
+            union { double d; uint64_t u; } u; u.d = val->fval;
+            for (int i = 0; i < 8; i++) buf[off+i] = (unsigned char)((u.u >> (8*i)) & 0xff);
+        }
+    } else if (val->kind == ND_STR) {
+        /* string pointer: store the address in linear memory as 4-byte i32 */
+        int saddr = alloc_string(val->sval);
+        for (int i = 0; i < 4; i++) buf[off+i] = (saddr >> (8*i)) & 0xff;
+    }
+    /* other expr kinds (not constant) ignored -- zero remains */
+}
+
+static void wasm_serial_array(struct Node *list, struct Type *arr_type,
+                               unsigned char *buf, int base, int buf_sz) {
+    struct Type *et = arr_type->base;
+    int esz    = type_size(et);
+    int count  = arr_type->array_size;
+    int max_idx = 0;
+    for (struct Node *e = list ? list->stmts : NULL; e; e = e->next)
+        if ((int)e->ival > max_idx) max_idx = (int)e->ival;
+    int n_elems = (count > 0) ? count : max_idx + 1;
+    for (struct Node *e = list ? list->stmts : NULL; e; e = e->next) {
+        int idx = (int)e->ival;
+        if (idx < 0 || idx >= n_elems) continue;
+        int off = base + idx * esz;
+        if (off + esz > buf_sz) continue;
+        wasm_serial_init(e->lhs, et, buf, off, buf_sz);
+    }
+}
+
+static void wasm_serial_struct(struct Node *list, struct Type *st,
+                                unsigned char *buf, int base, int buf_sz) {
+    int seq = 0;
+    for (struct Node *e = list ? list->stmts : NULL; e; e = e->next) {
+        struct Member *m = NULL;
+        if (e->name) {
+            for (struct Member *mb = st->members; mb; mb = mb->next)
+                if (mb->name && strcmp(mb->name, e->name) == 0) { m = mb; break; }
+        } else {
+            int idx = 0;
+            for (struct Member *mb = st->members; mb; mb = mb->next) {
+                if (!mb->name) continue;
+                if (idx++ == seq) { m = mb; break; }
+            }
+        }
+        if (!m) { seq++; continue; }
+        int off = base + m->offset;
+        if (off + type_size(m->type) <= buf_sz)
+            wasm_serial_init(e->lhs, m->type, buf, off, buf_sz);
+        seq++;
+    }
+}
+
+static void wasm_serial_init(struct Node *init, struct Type *type,
+                              unsigned char *buf, int buf_off, int buf_sz) {
+    if (!init) return;
+    if (init->kind == ND_INIT_LIST) {
+        if (type->kind == TY_ARRAY)
+            wasm_serial_array(init, type, buf, buf_off, buf_sz);
+        else if (type->kind == TY_STRUCT || type->kind == TY_UNION)
+            wasm_serial_struct(init, type, buf, buf_off, buf_sz);
+        else if (init->stmts)
+            wasm_serial_scalar(init->stmts->lhs, type, buf, buf_off);
+    } else {
+        wasm_serial_scalar(init, type, buf, buf_off);
+    }
+}
+
+/* Emit a WAT (data ...) segment for the byte buffer. */
+static void emit_data_seg(int addr, const unsigned char *buf, int sz) {
+    /* WAT data segment syntax: (data (i32.const ADDR) "...escaped bytes...") */
+    fprintf(out, "  (data (i32.const %d) \"", addr);
+    for (int i = 0; i < sz; i++) {
+        unsigned char ch = buf[i];
+        if (ch >= 0x20 && ch < 0x7f && ch != 0x22 /* " */ && ch != 0x5c /* \ */)
+            fputc(ch, out);
+        else
+            fprintf(out, "\\%02x", ch);
+    }
+    fprintf(out, "\")\n");
+}
+
 void gen_gvar(struct Node *gv) {
     int sz   = type_size(gv->type);
     int addr = gvar_alloc(gv->name, sz);
-    (void)addr;
-    /* Initialisers are emitted into a data segment at the end (see gen_func
-       preamble pass in main). We record them for the data section. */
-    if (gv->init) {
-        /* For now: store the serialised initialiser as a data comment.
-           Integer initialisers are trivially encoded; float needs bit-casting. */
-        /* We'll handle this in the module footer. */
-        gv->ival = addr;   /* stash address for the footer */
-    }
+    gv->ival = addr;   /* stash for module_close */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1255,40 +1347,19 @@ void wasm_emit_module_open(struct Node *program) {
 
 /* Call this from main() AFTER all gen_func/gen_gvar calls */
 void wasm_emit_module_close(struct Node *program) {
-    /* Emit data segments for strings and float literals */
-    for (DataSeg *d = data_segs; d; d = d->next) {
-        /* Encode bytes as escaped string */
-        fprintf(out, "  (data (i32.const %d) \"", d->addr);
-        for (int i = 0; i < d->len; i++) {
-            unsigned char c = (unsigned char)d->bytes[i];
-            if (c >= 0x20 && c < 0x7f && c != '"' && c != '\\')
-                fputc(c, out);
-            else
-                fprintf(out, "\\%02x", c);
-        }
-        fprintf(out, "\")\n");
-    }
+    /* Emit data segments for string/float literals collected during codegen */
+    for (DataSeg *d = data_segs; d; d = d->next)
+        emit_data_seg(d->addr, (const unsigned char *)d->bytes, d->len);
 
     /* Emit global variable initial values as data segments */
     for (struct Node *n = program; n; n = n->next) {
         if (n->kind != ND_GVAR || !n->init) continue;
         int addr = (int)n->ival;
         int sz   = type_size(n->type);
-        fprintf(out, "  (data (i32.const %d) \"", addr);
-        if (n->init->kind == ND_INT) {
-            long long v = n->init->ival;
-            for (int i = 0; i < sz; i++)
-                fprintf(out, "\\%02x", (unsigned)((v >> (8*i)) & 0xff));
-        } else if (n->init->kind == ND_FLOAT) {
-            if (sz == 4) {
-                union { float f; uint32_t u; } u; u.f = (float)n->init->fval;
-                for (int i = 0; i < 4; i++) fprintf(out, "\\%02x", (u.u >> (8*i)) & 0xff);
-            } else {
-                union { double d; uint64_t u; } u; u.d = n->init->fval;
-                for (int i = 0; i < 8; i++) fprintf(out, "\\%02x", (unsigned)((u.u >> (8*i)) & 0xff));
-            }
-        }
-        fprintf(out, "\")\n");
+        /* Serialise the initializer into a zero-filled byte buffer */
+        unsigned char *buf = arena_alloc(sz);
+        wasm_serial_init(n->init, n->type, buf, 0, sz);
+        emit_data_seg(addr, buf, sz);
     }
 
     DEDENT();

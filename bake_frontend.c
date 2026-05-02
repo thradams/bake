@@ -1313,6 +1313,7 @@ static int local_offset; /* tracks current frame size during resolution */
 
 static void resolve_expr(struct Node *n);
 static void resolve_stmt(struct Node *n);
+static void resolve_init(struct Node *n, struct Type *type);
 
 static void resolve_expr(struct Node *n) {
     if (!n) return;
@@ -1442,8 +1443,43 @@ static void resolve_expr(struct Node *n) {
         case ND_CAST:
             resolve_expr(n->lhs);
             break;
+        case ND_INIT_LIST:
+            resolve_init(n, n->type);
+            break;
         default: break;
     }
+}
+
+/* Resolve all expressions inside an initializer (scalar or ND_INIT_LIST). */
+static void resolve_init(struct Node *n, struct Type *type) {
+    if (!n) return;
+    if (n->kind == ND_INIT_LIST) {
+        n->type = type;
+        int seq = 0;
+        for (struct Node *e = n->stmts; e; e = e->next) {
+            struct Type *et = NULL;
+            if (type) {
+                if (type->kind == TY_ARRAY) {
+                    et = type->base;
+                } else if (type->kind == TY_STRUCT || type->kind == TY_UNION) {
+                    if (e->name) {
+                        for (struct Member *m = type->members; m; m = m->next)
+                            if (m->name && strcmp(m->name, e->name) == 0) { et = m->type; break; }
+                    } else {
+                        int idx = 0;
+                        for (struct Member *m = type->members; m; m = m->next) {
+                            if (!m->name) continue;
+                            if (idx++ == seq) { et = m->type; break; }
+                        }
+                    }
+                }
+            }
+            resolve_init(e->lhs, et);
+            seq++;
+        }
+        return;
+    }
+    resolve_expr(n);
 }
 
 static void resolve_stmt(struct Node *n) {
@@ -1462,7 +1498,7 @@ static void resolve_stmt(struct Node *n) {
             n->offset    = -local_offset;
             n->is_local  = true;
             add_sym(n->name, n->type, true, n->offset);
-            if (n->init) resolve_expr(n->init);
+            if (n->init) resolve_init(n->init, n->type);
             break;
         }
         case ND_EXPR_STMT: resolve_expr(n->lhs);     break;

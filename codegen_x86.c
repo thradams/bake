@@ -1104,6 +1104,104 @@ static void gen_expr(struct Node *n) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Local variable list initializer -- runtime stores into stack slots  */
+/* ------------------------------------------------------------------ */
+
+static void emit_local_init_elem(struct Node *val, struct Type *type, int base_offset);
+
+static void emit_local_init_list(struct Node *list, struct Type *type, int base_offset) {
+    if (!list || list->kind != ND_INIT_LIST) {
+        /* scalar wrapped in list -- shouldn't happen, but handle defensively */
+        emit_local_init_elem(list, type, base_offset);
+        return;
+    }
+
+    if (type->kind == TY_ARRAY) {
+        struct Type *et = type->base;
+        int esz = type_size(et);
+        int count = type->array_size;
+
+        /* Build index->node map (same as global emit_array_init) */
+        int max_idx = 0;
+        for (struct Node *e = list->stmts; e; e = e->next)
+            if ((int)e->ival > max_idx) max_idx = (int)e->ival;
+        int n_elems = (count > 0) ? count : max_idx + 1;
+
+        /* Zero the entire array first -- simpler than tracking gaps */
+        emit("  leaq  %d(%%rbp), %%rdi", base_offset);
+        emit("  movl  $%d, %%ecx", type_size(type));
+        emit("  xorl  %%eax, %%eax");
+        emit("  rep stosb");
+
+        /* Then store only the initialised elements */
+        for (struct Node *e = list->stmts; e; e = e->next) {
+            int idx = (int)e->ival;
+            if (idx < 0 || (count > 0 && idx >= count)) continue;
+            int elem_off = base_offset + idx * esz;
+            if (e->lhs && e->lhs->kind == ND_INIT_LIST)
+                emit_local_init_list(e->lhs, et, elem_off);
+            else
+                emit_local_init_elem(e->lhs, et, elem_off);
+        }
+        return;
+    }
+
+    if (type->kind == TY_STRUCT || type->kind == TY_UNION) {
+        /* Zero the struct first */
+        emit("  leaq  %d(%%rbp), %%rdi", base_offset);
+        emit("  movl  $%d, %%ecx", type_size(type));
+        emit("  xorl  %%eax, %%eax");
+        emit("  rep stosb");
+
+        int seq = 0;
+        for (struct Node *e = list->stmts; e; e = e->next) {
+            /* Find member */
+            struct Member *m = NULL;
+            if (e->name) {
+                for (struct Member *mb = type->members; mb; mb = mb->next)
+                    if (mb->name && strcmp(mb->name, e->name) == 0) { m = mb; break; }
+            } else {
+                int idx = 0;
+                for (struct Member *mb = type->members; mb; mb = mb->next) {
+                    if (!mb->name) continue;
+                    if (idx++ == seq) { m = mb; break; }
+                }
+            }
+            if (!m) { seq++; continue; }
+            int moff = base_offset + m->offset;
+            if (e->lhs && e->lhs->kind == ND_INIT_LIST)
+                emit_local_init_list(e->lhs, m->type, moff);
+            else
+                emit_local_init_elem(e->lhs, m->type, moff);
+            seq++;
+        }
+        return;
+    }
+
+    /* scalar wrapped in braces: use first element */
+    struct Node *first = list->stmts ? list->stmts->lhs : NULL;
+    emit_local_init_elem(first, type, base_offset);
+}
+
+static void emit_local_init_elem(struct Node *val, struct Type *type, int base_offset) {
+    if (!val) return;   /* zero already written by rep stosb */
+    int sz = type_size(type);
+    if (is_float_type(type)) {
+        gen_expr(val);
+        if (type->kind == TY_FLOAT)
+            emit("  movss %%xmm0, %d(%%rbp)", base_offset);
+        else
+            emit("  movsd %%xmm0, %d(%%rbp)", base_offset);
+        return;
+    }
+    gen_expr(val);
+    if      (sz == 8) emit("  movq  %%rax, %d(%%rbp)", base_offset);
+    else if (sz == 4) emit("  movl  %%eax, %d(%%rbp)", base_offset);
+    else if (sz == 2) emit("  movw  %%ax,  %d(%%rbp)", base_offset);
+    else              emit("  movb  %%al,  %d(%%rbp)", base_offset);
+}
+
 static void gen_stmt(struct Node *n) {
     if (!n) return;
     switch (n->kind) {
@@ -1115,26 +1213,24 @@ static void gen_stmt(struct Node *n) {
             return;
         case ND_DECL:
             if (n->init) {
-                if (is_struct_type(n->type)) {
-                    /* The initialiser must be a struct-returning call (or another
-                       struct lvalue). gen_expr / gen_addr leaves rax = pointer
-                       to source struct. We then memcpy into the local slot. */
+                if (n->init->kind == ND_INIT_LIST) {
+                    /* brace-initializer: emit element-by-element stores into the stack slot */
+                    emit_local_init_list(n->init, n->type, n->offset);
+                } else if (is_struct_type(n->type)) {
+                    /* struct init from call or lvalue: memcpy into slot */
                     int sz = type_size(n->type);
                     bool init_is_call = (n->init->kind == ND_CALL);
                     if (init_is_call) {
-                        /* gen_expr for the call leaves rax = pointer to temp buf */
                         gen_expr(n->init);
-                        emit("  movq  %%rax, %%rsi");   /* source */
+                        emit("  movq  %%rax, %%rsi");
                     } else {
                         gen_addr(n->init);
                         emit("  movq  %%rax, %%rsi");
                     }
                     emit("  leaq  %d(%%rbp), %%rdi", n->offset);
                     emit_memcpy("rdi", "rsi", sz);
-                    /* pop the temp buffer that gen_expr(ND_CALL) left on the stack */
-                    if (init_is_call && n->init->ival > 0) {
+                    if (init_is_call && n->init->ival > 0)
                         emit("  addq $%lld, %%rsp", n->init->ival);
-                    }
                 } else {
                     gen_expr(n->init);
                     int sz = n->type ? type_size(n->type) : 8;
