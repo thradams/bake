@@ -1,5 +1,9 @@
 #include "bake.h"
 #include <ctype.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
 
 FILE *out;  /* output stream, set by main() */
 
@@ -1599,7 +1603,8 @@ void wasm_emit_module_close(struct Node *program) __attribute__((weak));
 int main(int argc, char **argv) {
     const char *input_path  = NULL;
     const char *output_path = NULL;
-    const char *target      = "x86";   /* default: x86-64 assembly */
+    const char *target      = "x86";
+    const char *elf_mode    = NULL;  /* "exe"/"dyn"/"obj" → invoke xasm */   /* default: x86-64 assembly */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0) {
@@ -1618,6 +1623,12 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "error: unknown target '%s' (supported: x86, wasm)\n", target);
                 return 1;
             }
+        } else if (strcmp(argv[i], "-exe") == 0) {
+            elf_mode = "exe";
+        } else if (strcmp(argv[i], "-dyn") == 0) {
+            elf_mode = "dyn";
+        } else if (strcmp(argv[i], "-obj") == 0) {
+            elf_mode = "obj";
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
             return 1;
@@ -1631,7 +1642,10 @@ int main(int argc, char **argv) {
     }
 
     if (!input_path) {
-        fprintf(stderr, "usage: bake [-target x86|wasm] [-o output] <input.c>\n");
+        fprintf(stderr, "usage: bake [-target x86|wasm] [-exe|-dyn|-obj] [-o output] <input.c>\n");
+        fprintf(stderr, "  -dyn   link via xasm (dynamically linked ELF, default)\n");
+        fprintf(stderr, "  -exe   link via xasm (statically linked ELF)\n");
+        fprintf(stderr, "  -obj   assemble via xasm (relocatable object)\n");
         return 1;
     }
 
@@ -1696,6 +1710,54 @@ int main(int argc, char **argv) {
     }
 
     if (output_path) fclose(out);
+
+    /* ----------------------------------------------------------------
+     * If an ELF mode was requested (-exe/-dyn/-obj), invoke xasm to
+     * assemble the .s into an ELF.  xasm is looked up next to bake.
+     * ---------------------------------------------------------------- */
+    if (elf_mode && !is_wasm && output_path) {
+        /* Find xasm in same directory as bake */
+        char xasm_path[4096];
+        const char *slash = strrchr(argv[0], '/');
+        if (slash) {
+            size_t dlen = (size_t)(slash - argv[0]) + 1;
+            memcpy(xasm_path, argv[0], dlen);
+            strcpy(xasm_path + dlen, "xasm");
+        } else {
+            strcpy(xasm_path, "./xasm");
+        }
+
+        /* Derive ELF output: strip .s suffix from the assembly file */
+        char elf_out[4096];
+        size_t olen = strlen(output_path);
+        if (olen > 2 && strcmp(output_path + olen - 2, ".s") == 0) {
+            memcpy(elf_out, output_path, olen - 2);
+            elf_out[olen - 2] = '\0';
+        } else {
+            snprintf(elf_out, sizeof(elf_out), "%s.elf", output_path);
+        }
+
+        /* fork + exec xasm */
+        char *xargs[] = { xasm_path, (char *)output_path,
+                          elf_out,   (char *)elf_mode, NULL };
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 1; }
+        if (pid == 0) {
+            execv(xasm_path, xargs);
+            xargs[0] = "xasm";          /* fallback: find on PATH */
+            execvp("xasm", xargs);
+            fprintf(stderr, "error: cannot exec xasm\n");
+            _exit(1);
+        }
+        int wst = 0;
+        waitpid(pid, &wst, 0);
+        if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0) {
+            fprintf(stderr, "error: xasm failed\n");
+            return 1;
+        }
+        chmod(elf_out, 0755);
+        fprintf(stderr, "output: %s\n", elf_out);
+    }
 
     return 0;
 }

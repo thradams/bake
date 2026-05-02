@@ -684,7 +684,7 @@ static int att_is_two_op(const char *m) {
         "mov","add","sub","and","or","xor","cmp","test",
         "lea","adc","sbb","imul","xchg","movsx","movzx",
         "movs","movb","movw","movl","movq",
-        "cmpxchg","bsf","bsr","bt","btc","btr","bts",NULL
+        "cmpxchg","bsf","bsr","bt","btc","btr","bts","movsxd",NULL
     };
     for (int i = 0; two_ops[i]; i++)
         if (strcasecmp(m, two_ops[i]) == 0) return 1;
@@ -708,7 +708,7 @@ static void strip_size_suffix(char *op) {
         "div","idiv","xchg","movsx","movzx","adc","sbb","rol","ror",
         "shl","sal","shr","sar","leave","enter","xor","cmpxchg",
         /* AT&T compound zero/sign-extend: movzb, movzw, movsb, movsw */
-        "movzb","movzw","movsb","movsw","movzl","movsl",NULL
+        "movzb","movzw","movsb","movsw","movzl","movsl","movslq",NULL
     };
     for (int i = 0; known[i]; i++) {
         if (strcasecmp(op, known[i]) == 0) {
@@ -716,9 +716,10 @@ static void strip_size_suffix(char *op) {
             if (strncasecmp(op, "movzb", 5) == 0 || strncasecmp(op, "movzw", 5) == 0 ||
                 strncasecmp(op, "movzl", 5) == 0)
                 strcpy(op, "movzx");
-            else if (strncasecmp(op, "movsb", 5) == 0 || strncasecmp(op, "movsw", 5) == 0 ||
-                     strncasecmp(op, "movsl", 5) == 0)
+            else if (strncasecmp(op, "movsb", 5) == 0 || strncasecmp(op, "movsw", 5) == 0)
                 strcpy(op, "movsx");
+            else if (strncasecmp(op, "movslq", 6) == 0 || strncasecmp(op, "movsl", 5) == 0)
+                strcpy(op, "movsxd");
             return; /* keep stripped */
         }
     }
@@ -1786,6 +1787,19 @@ void assemble_line(char *line) {
                 emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
                 emit_dword(imm);
             }
+        } else if (arg2 && parse_imm(arg2, &imm)) {
+            /* Two-operand imm: imul dst, imm  ->  imul dst, dst, imm (6B or 69) */
+            if (is_64bit_reg(arg1) || needs_rex(arg1))
+                emit_rex(is_64bit_reg(arg1) ? 1 : 0, needs_rex(arg1) ? 1 : 0, 0, needs_rex(arg1) ? 1 : 0);
+            if (imm >= -128 && imm <= 127) {
+                emit_byte(0x6b);
+                emit_byte((uint8_t)(0xc0 | ((r1 & 7) << 3) | (r1 & 7)));
+                emit_byte((int8_t)imm);
+            } else {
+                emit_byte(0x69);
+                emit_byte((uint8_t)(0xc0 | ((r1 & 7) << 3) | (r1 & 7)));
+                emit_dword((uint32_t)imm);
+            }
         } else if (arg2 && (r2 = parse_reg(arg2)) != -1) {
             /* Two-operand: imul dst, src  ->  0F AF /r
                REX.R extends dst (r1), REX.B extends src (r2) */
@@ -2102,9 +2116,23 @@ void assemble_line(char *line) {
         emit_byte(0x48); emit_byte(0x98);
     }
     else if (strcasecmp(op, "movsxd") == 0 && arg1 && arg2) {
-        r1 = parse_reg(arg1);
-        r2 = parse_reg(arg2);
-        emit_byte(0x63); emit_byte(0xc0 + ((r1 & 7) << 3) + (r2 & 7));
+        /* movsxd r64, r/m32  — REX.W 0x63 /r
+         * After AT&T swap: arg1=dst(r64), arg2=src(r32 or [mem]) */
+        r1 = parse_reg(arg1);   /* destination register (e.g. rax=0) */
+        r2 = parse_reg(arg2);   /* source register, or -1 if memory  */
+        int rex_r = (r1 >= 0) ? (r1 >> 3) & 1 : 0;
+        int rex_b = (r2 >= 0) ? (r2 >> 3) & 1 : 0;
+        emit_rex(1, rex_r, 0, rex_b);
+        emit_byte(0x63);
+        if (r2 >= 0) {
+            /* reg-reg: ModRM = 11 dst src */
+            emit_byte((uint8_t)(0xc0 | ((r1 & 7) << 3) | (r2 & 7)));
+        } else {
+            /* reg-mem: emit ModRM + SIB + disp via emit_mem_operand */
+            MemOperand mem;
+            if (parse_mem_operand(arg2, &mem))
+                emit_mem_operand(&mem, (uint8_t)(r1 & 7));
+        }
     }
     else if (strcasecmp(op, "movsb") == 0) {
         emit_byte(0xa4);
