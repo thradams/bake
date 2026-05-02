@@ -1567,7 +1567,11 @@ void resolve_func(struct Node *fn) {
     }
 
     resolve_stmt(fn->body);
-    /* align frame to 16 bytes */
+    /* Align frame to 16 bytes.
+     * At main entry rsp % 16 = 8 (callq pushed return addr).
+     * pushq rbp makes rsp % 16 = 0.
+     * subq $frame_size keeps it 0 iff frame_size % 16 == 0.
+     * So round up to next multiple of 16. */
     fn->ival = (local_offset + 15) & ~15;
     pop_scope();
 }
