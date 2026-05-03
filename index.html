@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>bake · wasm runner</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #0f1117;
+    color: #e2e8f0;
+    min-height: 100vh;
+    padding: 2rem;
+  }
+
+  h1 {
+    font-size: 1.4rem;
+    font-weight: 600;
+    letter-spacing: .02em;
+    margin-bottom: 1.5rem;
+    color: #a78bfa;
+  }
+
+  h1 span { color: #64748b; font-weight: 400; }
+
+  .card {
+    background: #1e2130;
+    border: 1px solid #2d3148;
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1.25rem;
+  }
+
+  label {
+    display: block;
+    font-size: .78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: #64748b;
+    margin-bottom: .6rem;
+  }
+
+  /* ── file drop ── */
+  #drop {
+    border: 2px dashed #3b4263;
+    border-radius: 8px;
+    padding: 2rem;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .2s, background .2s;
+    color: #64748b;
+    font-size: .9rem;
+  }
+  #drop.over, #drop:hover { border-color: #a78bfa; background: #1a1b2e; color: #e2e8f0; }
+  #drop input { display: none; }
+  #drop strong { display: block; font-size: 1rem; margin-bottom: .3rem; color: #e2e8f0; }
+
+  /* ── exports list ── */
+  #exports-wrap { display: none; }
+
+  .fn-row {
+    display: flex;
+    align-items: center;
+    gap: .75rem;
+    margin-bottom: .6rem;
+    flex-wrap: wrap;
+  }
+
+  .fn-name {
+    font-family: monospace;
+    font-size: .95rem;
+    color: #93c5fd;
+    min-width: 120px;
+  }
+
+  .fn-row input[type=number] {
+    width: 80px;
+    background: #0f1117;
+    border: 1px solid #3b4263;
+    border-radius: 5px;
+    color: #e2e8f0;
+    padding: .3rem .5rem;
+    font-family: monospace;
+    font-size: .9rem;
+  }
+
+  .fn-row button {
+    background: #a78bfa;
+    color: #0f1117;
+    border: none;
+    border-radius: 5px;
+    padding: .35rem .85rem;
+    font-weight: 700;
+    font-size: .85rem;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  .fn-row button:hover { background: #c4b5fd; }
+
+  .fn-result {
+    font-family: monospace;
+    font-size: .95rem;
+    color: #4ade80;
+    min-width: 80px;
+  }
+
+  /* ── console ── */
+  #console {
+    font-family: 'Fira Code', monospace;
+    font-size: .82rem;
+    background: #0a0c14;
+    border-radius: 6px;
+    padding: .85rem 1rem;
+    min-height: 80px;
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    line-height: 1.6;
+  }
+
+  .log-ok   { color: #4ade80; }
+  .log-err  { color: #f87171; }
+  .log-info { color: #94a3b8; }
+  .log-val  { color: #fbbf24; }
+</style>
+</head>
+<body>
+
+<h1>bake <span>· wasm runner</span></h1>
+
+<!-- ── File loader ── -->
+<div class="card">
+  <label>Load .wasm or .wat file</label>
+  <div id="drop">
+    <input type="file" id="file-input" accept=".wasm,.wat">
+    <strong>Drop file here</strong>
+    or click to browse — <code>.wasm</code> or <code>.wat</code>
+  </div>
+</div>
+
+<!-- ── Exports ── -->
+<div class="card" id="exports-wrap">
+  <label>Exported functions</label>
+  <div id="exports"></div>
+</div>
+
+<!-- ── Console ── -->
+<div class="card">
+  <label>Console</label>
+  <div id="console"><span class="log-info">Waiting for .wasm file…</span></div>
+</div>
+
+<script>
+// ── Tiny console ────────────────────────────────────────────────
+const con = document.getElementById('console');
+function log(msg, cls = 'log-info') {
+  const s = document.createElement('span');
+  s.className = cls;
+  s.textContent = msg + '\n';
+  con.appendChild(s);
+  con.scrollTop = con.scrollHeight;
+}
+function clearCon() { con.innerHTML = ''; }
+
+// ── Shared memory / imports for bake wasm modules ────────────────
+// bake wasm always imports env.malloc and env.free.
+// We provide trivial bump-allocator stubs so the module loads.
+let heapPtr = 2 * 1024 * 1024;   // start above bake's software stack
+
+const importObj = {
+  env: {
+    malloc: (size) => {
+      const p = heapPtr;
+      heapPtr = (heapPtr + Number(size) + 7) & ~7;
+      return p;
+    },
+    free: () => {},
+    printf: () => {},   // stub — bake wasm dies on variadic calls anyway
+  }
+};
+
+// ── Load wasm bytes ──────────────────────────────────────────────
+let wasmInstance = null;
+
+async function loadBytes(bytes) {
+  clearCon();
+  try {
+    const result = await WebAssembly.instantiate(bytes, importObj);
+    wasmInstance = result.instance;
+    log('Module loaded ✓', 'log-ok');
+    renderExports(wasmInstance.exports);
+  } catch (e) {
+    log('Error: ' + e.message, 'log-err');
+  }
+}
+
+// ── WAT → wasm via fetch to wat2wasm CDN (if available) ──────────
+// Browsers can't run wat2wasm natively; we skip WAT and just note it.
+async function handleFile(file) {
+  clearCon();
+  log(`Loading ${file.name} (${(file.size/1024).toFixed(1)} KB)…`);
+  const buf = await file.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+
+  if (file.name.endsWith('.wat') || (bytes[0] === 0x28)) {
+    // Looks like text WAT — we can't assemble in-browser without wat2wasm.
+    // Instruct the user to convert first.
+    log('WAT detected. Convert to .wasm first:', 'log-err');
+    log('  wat2wasm your_file.wat -o your_file.wasm', 'log-val');
+    log('Then reload the .wasm file here.');
+    return;
+  }
+
+  // Validate wasm magic
+  if (bytes[0] !== 0x00 || bytes[1] !== 0x61 ||
+      bytes[2] !== 0x73 || bytes[3] !== 0x6d) {
+    log('Not a valid .wasm file (bad magic bytes)', 'log-err');
+    return;
+  }
+
+  await loadBytes(bytes);
+}
+
+// ── Render export buttons ────────────────────────────────────────
+function renderExports(exports) {
+  const wrap = document.getElementById('exports-wrap');
+  const div  = document.getElementById('exports');
+  div.innerHTML = '';
+
+  const fns = Object.entries(exports).filter(([,v]) => typeof v === 'function');
+  if (fns.length === 0) {
+    log('No exported functions found.', 'log-err');
+    wrap.style.display = 'none';
+    return;
+  }
+
+  wrap.style.display = '';
+
+  for (const [name, fn] of fns) {
+    if (name === 'memory') continue;
+    const arity = fn.length;  // wasm function arity
+    const row = document.createElement('div');
+    row.className = 'fn-row';
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'fn-name';
+    nameEl.textContent = name + '(…)';
+    row.appendChild(nameEl);
+
+    // one input per parameter
+    const inputs = [];
+    for (let i = 0; i < arity; i++) {
+      const inp = document.createElement('input');
+      inp.type = 'number';
+      inp.value = '0';
+      inp.placeholder = `arg${i}`;
+      row.appendChild(inp);
+      inputs.push(inp);
+    }
+
+    const btn = document.createElement('button');
+    btn.textContent = 'Call';
+    row.appendChild(btn);
+
+    const result = document.createElement('span');
+    result.className = 'fn-result';
+    row.appendChild(result);
+
+    btn.addEventListener('click', () => {
+      try {
+        // bake wasm uses i64 for all integer params — pass as BigInt
+        const args = inputs.map(inp => BigInt(inp.value || '0'));
+        const ret = fn(...args);
+        const display = (typeof ret === 'bigint') ? ret.toString()
+                      : (ret === undefined) ? 'void'
+                      : String(ret);
+        result.textContent = '→ ' + display;
+        log(`${name}(${args.join(', ')}) = ${display}`, 'log-val');
+      } catch(e) {
+        result.textContent = 'error';
+        log(`${name}: ${e.message}`, 'log-err');
+      }
+    });
+
+    div.appendChild(row);
+  }
+
+  log(`Found ${fns.length} export(s): ${fns.map(([n])=>n).join(', ')}`);
+}
+
+// ── Drag-and-drop + file input ───────────────────────────────────
+const drop  = document.getElementById('drop');
+const input = document.getElementById('file-input');
+
+drop.addEventListener('click', () => input.click());
+input.addEventListener('change', () => { if (input.files[0]) handleFile(input.files[0]); });
+
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('over');
+  const file = e.dataTransfer.files[0];
+  if (file) handleFile(file);
+});
+</script>
+</body>
+</html>

@@ -519,7 +519,7 @@ static void wasm_gen_expr(struct Node *n) {
               iemit("i64.const 0");   /* default false result */
               wasm_gen_expr(n->lhs);
               if (node_is_float(n->lhs)) { iemit("f64.const 0.0"); iemit("f64.ne"); iemit("i64.extend_i32_s"); }
-              iemit("i64.const 0"); iemit("i64.eq"); iemit("i32.wrap_i64");
+              iemit("i64.const 0"); iemit("i64.eq");
               iemit("br_if $land_end_%d", lbl);   /* short-circuit: leave 0 */
               iemit("drop");   /* discard the 0 we pushed as default */
               wasm_gen_expr(n->rhs);
@@ -760,7 +760,6 @@ static void wasm_gen_expr(struct Node *n) {
             wasm_gen_expr(n->cond);
             if (node_is_float(n->cond)) { iemit("f64.const 0.0"); iemit("f64.eq"); }
             else { iemit("i64.const 0"); iemit("i64.eq"); }
-            iemit("i32.wrap_i64");
             iemit("br_if $telse_%d", lbl);
             wasm_gen_expr(n->then);
             iemit("br $tend_%d", lbl);
@@ -965,7 +964,6 @@ static void wasm_gen_stmt(struct Node *n) {
             wasm_gen_expr(n->cond);
             if (node_is_float(n->cond)) { iemit("f64.const 0.0"); iemit("f64.ne"); }
             else { iemit("i64.const 0"); iemit("i64.ne"); }
-            iemit("i32.wrap_i64");
             iemit("if");
               INDENT();
               wasm_gen_stmt(n->then);
@@ -1011,7 +1009,7 @@ static void wasm_gen_stmt(struct Node *n) {
                 INDENT();
                 wasm_gen_stmt(n->body);
                 wasm_gen_expr(n->cond);
-                iemit("i64.const 0"); iemit("i64.ne"); iemit("i32.wrap_i64");
+                iemit("i64.const 0"); iemit("i64.ne");
                 iemit("br_if $loop_%d", lbl);
               DEDENT();
               iemit("end ;; loop_%d", lbl);
@@ -1034,7 +1032,7 @@ static void wasm_gen_stmt(struct Node *n) {
                 INDENT();
                 if (n->cond) {
                     wasm_gen_expr(n->cond);
-                    iemit("i64.const 0"); iemit("i64.eq"); iemit("i32.wrap_i64");
+                    iemit("i64.const 0"); iemit("i64.eq");
                     iemit("br_if $brk_%d", lbl);
                 }
                 wasm_gen_stmt(n->body);
