@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>bake · wasm runner</title>
+<script src="https://cdn.jsdelivr.net/npm/wabt@1.0.36/index.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -60,9 +61,9 @@
   <div id="drop">
     <input type="file" id="file-input" accept=".wasm,.wat">
     <strong>Drop file here</strong>
-    or click to browse &mdash; <code>.wasm</code>
+    or click to browse &mdash; <code>.wasm</code> or <code>.wat</code>
     <br><small style="margin-top:.4rem;display:block">
-      Compile: <code>./bake_wasm -target wasm prog.c -o prog.wat &amp;&amp; wat2wasm prog.wat -o prog.wasm</code>
+      Compile: <code>./bake_wasm -target wasm prog.c -o prog.wat</code>
     </small>
   </div>
 </div>
@@ -263,8 +264,25 @@ async function handleFile(file) {
   const buf   = await file.arrayBuffer();
   const bytes = new Uint8Array(buf);
   if (file.name.endsWith('.wat') || bytes[0]===0x28) {
-    log('.wat detected — convert first:', 'log-err');
-    log('  wat2wasm prog.wat -o prog.wasm', 'log-val'); return;
+    log('.wat detected — assembling with wabt…');
+    const src = new TextDecoder().decode(bytes);
+    try {
+      if (!window._wabt) {
+        log('Loading wabt…');
+        window._wabt = await WabtModule();
+      }
+      const m = window._wabt.parseWat(file.name, src, {
+        bulk_memory: true, threads: false
+      });
+      m.validate();
+      const bin = m.toBinary({ log: false }).buffer;
+      m.destroy();
+      log('WAT assembled ✓ (' + bin.byteLength + ' bytes)', 'log-ok');
+      await loadBytes(new Uint8Array(bin));
+    } catch(e) {
+      log('WAT error: ' + e.message, 'log-err');
+    }
+    return;
   }
   if (bytes[0]!==0x00||bytes[1]!==0x61||bytes[2]!==0x73||bytes[3]!==0x6d) {
     log('Not a valid .wasm file', 'log-err'); return;
