@@ -1278,6 +1278,14 @@ struct Node *parse_program(void) {
             /* prototype */
             if (match(TK_SEMI)) {
                 add_proto(name, base, arity, variadic);
+                /* also emit ND_PROTO node so backends can see declarations */
+                struct Node *proto_node = new_node(ND_PROTO);
+                proto_node->name        = name;
+                proto_node->type        = base;
+                proto_node->is_variadic = variadic;
+                proto_node->ival        = arity;
+                if (!head) head = tail = proto_node;
+                else { tail->next = proto_node; tail = proto_node; }
                 continue;
             }
 

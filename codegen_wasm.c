@@ -26,7 +26,7 @@
  *
  * Limitations (acceptable for a teaching/hobby backend)
  * =====================================================
- * - No variadics (die with a clear message).
+ * - Variadic calls: args spilled to linear memory, JS import reads them.
  * - No goto / labels (die with a clear message).
  * - Structs > 16 bytes are passed by pointer to linear memory only.
  * - The software stack ($__sp) is 1 MB, growing downward from STACK_TOP.
@@ -39,7 +39,8 @@
 
 #define GLOBAL_BASE   4096        /* byte offset where globals start    */
 #define STACK_TOP     (1<<20)     /* 1 MB software stack top            */
-#define MEMORY_PAGES  16          /* 16 * 64KB = 1 MB initial memory    */
+#define DATA_START    ((1<<20)+4096) /* string literals start above stack */
+#define MEMORY_PAGES  32          /* 32 * 64KB = 2 MB initial memory    */
 
 /* ------------------------------------------------------------------ */
 /* emit() -- line-oriented output (required by bake.h API)             */
@@ -162,7 +163,7 @@ typedef struct DataSeg {
 } DataSeg;
 
 static DataSeg *data_segs  = NULL;
-static int      data_next  = STACK_TOP; /* data starts right above stack */
+static int      data_next  = DATA_START; /* string literals above stack */
 
 static int alloc_data(const char *src, int len) {
     /* pad to 8-byte alignment */
@@ -772,22 +773,108 @@ static void wasm_gen_expr(struct Node *n) {
     }
 
     case ND_CALL: {
-        if (n->is_variadic) die("wasm: variadic calls not supported");
         struct ProtoEntry *pe = n->name ? find_proto(n->name) : NULL;
-        if (pe && pe->is_variadic) die("wasm: variadic call to '%s' not supported", n->name);
+        bool variadic = (pe && pe->is_variadic) || n->is_variadic;
 
-        /* Push args */
-        for (struct Node *a = n->args; a; a = a->next)
-            wasm_gen_expr(a);
+        if (variadic) {
+            /* Variadic call convention for wasm:
+             * We materialise a contiguous i64 array on the software stack,
+             * one slot per variadic argument, then call the function as:
+             *   fn(fixed_arg0, ..., fixed_argN, va_buf_i32, va_count_i64)
+             * The JS import reads the args from linear memory.
+             *
+             * Layout: va_buf grows downward from $__sp - 8 * va_count.
+             *
+             * For printf specifically we emit a call to $__printf_impl
+             * which is imported from JS and implements full printf formatting.
+             */
+            int fixed_argc = pe ? pe->arity : 0; /* known fixed args */
 
-        if (n->callee) {
-            /* indirect call -- needs a table; emit as direct call with warning */
-            iemit(";; indirect call not fully supported; calling callee expr");;
-            iemit("drop");   /* discard args for now */
-            iemit(";; unreachable");
-            iemit("unreachable");
+            /* Count variadic args (total args - fixed) */
+            int total_args = 0;
+            for (struct Node *a = n->args; a; a = a->next) total_args++;
+            int va_count = total_args - fixed_argc;
+            if (va_count < 0) va_count = 0;
+
+            /* Allocate va_buf on software stack */
+            if (va_count > 0) {
+                iemit(";; variadic call: allocate va_buf (%d slots)", va_count);
+                iemit("global.get $__sp");
+                iemit("i32.const %d", va_count * 8);
+                iemit("i32.sub");
+                iemit("global.set $__sp");
+            }
+
+            /* Evaluate and store variadic args into the buffer */
+            int va_idx = 0;
+            int arg_idx = 0;
+            for (struct Node *a = n->args; a; a = a->next, arg_idx++) {
+                if (arg_idx < fixed_argc) continue; /* skip fixed args for now */
+                /* store into va_buf[va_idx] = $__sp + va_idx*8 */
+                iemit("global.get $__sp");
+                if (va_idx > 0) {
+                    iemit("i32.const %d", va_idx * 8);
+                    iemit("i32.add");
+                }
+                wasm_gen_expr(a);
+                /* convert float args to f64 so JS can read uniformly */
+                if (a->type && a->type->kind == TY_FLOAT)
+                    iemit("f64.promote_f32");
+                else if (a->type && a->type->kind == TY_DOUBLE)
+                    ; /* already f64 */
+                else
+                    ; /* i64 */
+                /* store as i64 (f64 has same bit width) */
+                if (a->type && (a->type->kind == TY_FLOAT || a->type->kind == TY_DOUBLE))
+                    iemit("f64.store");
+                else
+                    iemit("i64.store");
+                va_idx++;
+            }
+
+            /* Push fixed args */
+            arg_idx = 0;
+            for (struct Node *a = n->args; a; a = a->next, arg_idx++) {
+                if (arg_idx >= fixed_argc) break;
+                wasm_gen_expr(a);
+            }
+
+            /* Push va_buf pointer and count */
+            if (va_count > 0) {
+                iemit("global.get $__sp");   /* va_buf ptr (i32) */
+                iemit("i64.const %d", va_count);
+            } else {
+                iemit("i32.const 0");
+                iemit("i64.const 0");
+            }
+
+            /* Determine which imported variadic function to call */
+            const char *callee_name = n->name ? n->name : "printf";
+            /* We route all variadic imports through a __<name>_variadic wrapper
+             * that the JS side implements with (fmt, va_ptr, va_count) signature. */
+            char wname[128];
+            snprintf(wname, sizeof(wname), "$__%s_variadic", callee_name);
+            iemit("call %s", wname);
+
+            /* Free va_buf */
+            if (va_count > 0) {
+                iemit(";; free va_buf");
+                iemit("global.get $__sp");
+                iemit("i32.const %d", va_count * 8);
+                iemit("i32.add");
+                iemit("global.set $__sp");
+            }
         } else {
-            iemit("call $%s", n->name);
+            /* Non-variadic: push args and call directly */
+            for (struct Node *a = n->args; a; a = a->next)
+                wasm_gen_expr(a);
+
+            if (n->callee) {
+                iemit(";; indirect call -- not fully supported");
+                iemit("unreachable");
+            } else {
+                iemit("call $%s", n->name);
+            }
         }
         return;
     }
@@ -1176,6 +1263,11 @@ void gen_func(struct Node *fn) {
         iemit("global.set $__sp");
     }
 
+    /* If function returns a value, emit a default i64.const 0 as fallthrough.
+     * Explicit returns already handled in wasm_gen_stmt ND_RETURN. */
+    if (fn->type && fn->type->kind != TY_VOID)
+        iemit("i64.const 0  ;; implicit return 0");
+
     DEDENT();
     iemit(")");
     iemit("(export \"%s\" (func $%s))", fn->name, fn->name);
@@ -1321,25 +1413,36 @@ void wasm_emit_module_open(struct Node *program) {
     iemit("(module");
     INDENT();
 
-    /* Collect imported protos */
-    for (struct Node *n = program; n; n = n->next) {
-        if (n->kind == ND_PROTO)
-            need_import(n->name);
-    }
-    /* Also scan all call nodes for unknown names (malloc, free, etc.) */
-    /* (A simple heuristic: any name that has a ProtoEntry but no ND_FUNC.) */
+    /* WAT rule: imports must come before memory/globals.
+     * Emit all imports first, then memory and stack global. */
 
-    /* Emit imports */
+    /* Collect protos: variadic → variadic wrapper, non-variadic → plain import */
+    for (struct Node *n = program; n; n = n->next) {
+        if (n->kind != ND_PROTO) continue;
+        struct ProtoEntry *pe = find_proto(n->name);
+        if (pe && pe->is_variadic) {
+            /* variadic: emit wrapper with (fixed..., va_ptr i32, va_count i64) → i64 */
+            /* Build param list: arity fixed params + va_ptr + va_count */
+            char params[512] = "";
+            for (int i = 0; i < pe->arity; i++)
+                strcat(params, " (param i64)");
+            strcat(params, " (param i32) (param i64)");
+            iemit("(import \"env\" \"%s_variadic\" (func $__%s_variadic%s (result i64)))"
+                  , n->name, n->name, params);
+        } else {
+            need_import(n->name);
+        }
+    }
+
+    /* Emit non-variadic imports */
     for (ImportEntry *e = imports; e; e = e->next)
         emit_import(e->name);
-    /* Always import malloc/free (registered by main in bake_frontend) */
+    /* Always import malloc/free */
     emit_import("malloc");
     emit_import("free");
 
-    /* Memory */
+    /* Memory and stack global AFTER all imports (WAT requirement) */
     iemit("(memory (export \"memory\") %d)", MEMORY_PAGES);
-
-    /* Software stack pointer global */
     iemit("(global $__sp (mut i32) (i32.const %d))", STACK_TOP);
 }
 

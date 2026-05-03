@@ -6,222 +6,203 @@
 <title>bake · wasm runner</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-
   body {
     font-family: 'Segoe UI', system-ui, sans-serif;
-    background: #0f1117;
-    color: #e2e8f0;
-    min-height: 100vh;
-    padding: 2rem;
+    background: #0f1117; color: #e2e8f0;
+    min-height: 100vh; padding: 2rem;
   }
-
-  h1 {
-    font-size: 1.4rem;
-    font-weight: 600;
-    letter-spacing: .02em;
-    margin-bottom: 1.5rem;
-    color: #a78bfa;
-  }
-
-  h1 span { color: #64748b; font-weight: 400; }
-
-  .card {
-    background: #1e2130;
-    border: 1px solid #2d3148;
-    border-radius: 10px;
-    padding: 1.25rem 1.5rem;
-    margin-bottom: 1.25rem;
-  }
-
-  label {
-    display: block;
-    font-size: .78rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: .08em;
-    color: #64748b;
-    margin-bottom: .6rem;
-  }
-
-  /* ── file drop ── */
-  #drop {
-    border: 2px dashed #3b4263;
-    border-radius: 8px;
-    padding: 2rem;
-    text-align: center;
-    cursor: pointer;
-    transition: border-color .2s, background .2s;
-    color: #64748b;
-    font-size: .9rem;
-  }
-  #drop.over, #drop:hover { border-color: #a78bfa; background: #1a1b2e; color: #e2e8f0; }
-  #drop input { display: none; }
-  #drop strong { display: block; font-size: 1rem; margin-bottom: .3rem; color: #e2e8f0; }
-
-  /* ── exports list ── */
-  #exports-wrap { display: none; }
-
-  .fn-row {
-    display: flex;
-    align-items: center;
-    gap: .75rem;
-    margin-bottom: .6rem;
-    flex-wrap: wrap;
-  }
-
-  .fn-name {
-    font-family: monospace;
-    font-size: .95rem;
-    color: #93c5fd;
-    min-width: 120px;
-  }
-
-  .fn-row input[type=number] {
-    width: 80px;
-    background: #0f1117;
-    border: 1px solid #3b4263;
-    border-radius: 5px;
-    color: #e2e8f0;
-    padding: .3rem .5rem;
-    font-family: monospace;
-    font-size: .9rem;
-  }
-
-  .fn-row button {
-    background: #a78bfa;
-    color: #0f1117;
-    border: none;
-    border-radius: 5px;
-    padding: .35rem .85rem;
-    font-weight: 700;
-    font-size: .85rem;
-    cursor: pointer;
-    transition: background .15s;
-  }
-  .fn-row button:hover { background: #c4b5fd; }
-
-  .fn-result {
-    font-family: monospace;
-    font-size: .95rem;
-    color: #4ade80;
-    min-width: 80px;
-  }
-
-  /* ── console ── */
-  #console {
-    font-family: 'Fira Code', monospace;
-    font-size: .82rem;
-    background: #0a0c14;
-    border-radius: 6px;
-    padding: .85rem 1rem;
-    min-height: 80px;
-    max-height: 300px;
-    overflow-y: auto;
-    white-space: pre-wrap;
-    line-height: 1.6;
-  }
-
-  .log-ok   { color: #4ade80; }
-  .log-err  { color: #f87171; }
-  .log-info { color: #94a3b8; }
-  .log-val  { color: #fbbf24; }
+  h1 { font-size: 1.4rem; font-weight: 600; letter-spacing:.02em;
+       margin-bottom:1.5rem; color:#a78bfa; }
+  h1 span { color:#64748b; font-weight:400; }
+  .card { background:#1e2130; border:1px solid #2d3148; border-radius:10px;
+          padding:1.25rem 1.5rem; margin-bottom:1.25rem; }
+  label { display:block; font-size:.78rem; font-weight:600;
+          text-transform:uppercase; letter-spacing:.08em;
+          color:#64748b; margin-bottom:.6rem; }
+  #drop { border:2px dashed #3b4263; border-radius:8px; padding:2rem;
+          text-align:center; cursor:pointer;
+          transition:border-color .2s,background .2s; color:#64748b; font-size:.9rem; }
+  #drop.over,#drop:hover { border-color:#a78bfa; background:#1a1b2e; color:#e2e8f0; }
+  #drop input { display:none; }
+  #drop strong { display:block; font-size:1rem; margin-bottom:.3rem; color:#e2e8f0; }
+  #exports-wrap { display:none; }
+  .fn-row { display:flex; align-items:center; gap:.75rem;
+            margin-bottom:.6rem; flex-wrap:wrap; }
+  .fn-name { font-family:monospace; font-size:.95rem; color:#93c5fd; min-width:130px; }
+  .fn-row input[type=number] { width:80px; background:#0f1117; border:1px solid #3b4263;
+    border-radius:5px; color:#e2e8f0; padding:.3rem .5rem;
+    font-family:monospace; font-size:.9rem; }
+  .fn-row button { background:#a78bfa; color:#0f1117; border:none; border-radius:5px;
+    padding:.35rem .85rem; font-weight:700; font-size:.85rem; cursor:pointer; }
+  .fn-row button:hover { background:#c4b5fd; }
+  .fn-result { font-family:monospace; font-size:.95rem; color:#4ade80; }
+  #console-toolbar { display:flex; justify-content:space-between;
+                     align-items:center; margin-bottom:.4rem; }
+  #console-toolbar label { margin:0; }
+  #clear-btn { font-size:.75rem; background:none; border:1px solid #3b4263;
+               border-radius:4px; color:#64748b; padding:.15rem .5rem; cursor:pointer; }
+  #clear-btn:hover { color:#e2e8f0; border-color:#a78bfa; }
+  #console { font-family:'Fira Code',monospace; font-size:.82rem; background:#0a0c14;
+             border-radius:6px; padding:.85rem 1rem; min-height:80px; max-height:380px;
+             overflow-y:auto; white-space:pre-wrap; line-height:1.6; }
+  .log-ok   { color:#4ade80; }
+  .log-err  { color:#f87171; }
+  .log-info { color:#94a3b8; }
+  .log-val  { color:#fbbf24; }
+  .log-out  { color:#e2e8f0; }
 </style>
 </head>
 <body>
-
 <h1>bake <span>· wasm runner</span></h1>
 
-<!-- ── File loader ── -->
 <div class="card">
-  <label>Load .wasm or .wat file</label>
+  <label>Load .wasm file</label>
   <div id="drop">
     <input type="file" id="file-input" accept=".wasm,.wat">
     <strong>Drop file here</strong>
-    or click to browse — <code>.wasm</code> or <code>.wat</code>
+    or click to browse &mdash; <code>.wasm</code>
+    <br><small style="margin-top:.4rem;display:block">
+      Compile: <code>./bake_wasm -target wasm prog.c -o prog.wat &amp;&amp; wat2wasm prog.wat -o prog.wasm</code>
+    </small>
   </div>
 </div>
 
-<!-- ── Exports ── -->
 <div class="card" id="exports-wrap">
   <label>Exported functions</label>
   <div id="exports"></div>
 </div>
 
-<!-- ── Console ── -->
 <div class="card">
-  <label>Console</label>
+  <div id="console-toolbar">
+    <label style="margin:0">Console</label>
+    <button id="clear-btn">clear</button>
+  </div>
   <div id="console"><span class="log-info">Waiting for .wasm file…</span></div>
 </div>
 
 <script>
-// ── Tiny console ────────────────────────────────────────────────
+// ── Console ──────────────────────────────────────────────────────
 const con = document.getElementById('console');
-function log(msg, cls = 'log-info') {
+function log(msg, cls='log-info') {
   const s = document.createElement('span');
-  s.className = cls;
-  s.textContent = msg + '\n';
-  con.appendChild(s);
+  s.className = cls; s.textContent = msg + '\n'; con.appendChild(s);
+  con.scrollTop = con.scrollHeight;
+}
+function logOut(text) {
+  const s = document.createElement('span');
+  s.className = 'log-out'; s.textContent = text; con.appendChild(s);
   con.scrollTop = con.scrollHeight;
 }
 function clearCon() { con.innerHTML = ''; }
+document.getElementById('clear-btn').addEventListener('click', clearCon);
 
-// ── Shared memory / imports for bake wasm modules ────────────────
-// bake wasm always imports env.malloc and env.free.
-// We provide trivial bump-allocator stubs so the module loads.
-let heapPtr = 2 * 1024 * 1024;   // start above bake's software stack
-
-const importObj = {
-  env: {
-    malloc: (size) => {
-      const p = heapPtr;
-      heapPtr = (heapPtr + Number(size) + 7) & ~7;
-      return p;
-    },
-    free: () => {},
-    printf: () => {},   // stub — bake wasm dies on variadic calls anyway
-  }
-};
-
-// ── Load wasm bytes ──────────────────────────────────────────────
+// ── Runtime state ────────────────────────────────────────────────
+let wasmMemory  = null;
+let mallocPtr   = 3 * 1024 * 1024;   // bump allocator at 3 MB
 let wasmInstance = null;
 
-async function loadBytes(bytes) {
-  clearCon();
-  try {
-    const result = await WebAssembly.instantiate(bytes, importObj);
-    wasmInstance = result.instance;
-    log('Module loaded ✓', 'log-ok');
-    renderExports(wasmInstance.exports);
-  } catch (e) {
-    log('Error: ' + e.message, 'log-err');
-  }
+function readCStr(ptr) {
+  if (!wasmMemory) return '';
+  const b = new Uint8Array(wasmMemory.buffer);
+  let s = ''; ptr = Number(ptr);
+  while (b[ptr]) s += String.fromCharCode(b[ptr++]);
+  return s;
 }
 
-// ── WAT → wasm via fetch to wat2wasm CDN (if available) ──────────
-// Browsers can't run wat2wasm natively; we skip WAT and just note it.
-async function handleFile(file) {
+// ── printf_variadic ───────────────────────────────────────────────
+// Called by bake wasm for any variadic C call.
+// Signature: (fmt_ptr: i64, va_buf: i32, va_count: i64) → i64
+function impl_printf(fmt_ptr, va_ptr, va_count) {
+  const fmt  = readCStr(fmt_ptr);
+  const view = new DataView(wasmMemory.buffer);
+  const n    = Number(va_count);
+  const args = [];
+  for (let i = 0; i < n; i++)
+    args.push(view.getBigInt64(Number(va_ptr) + i * 8, true));
+
+  let ai = 0;
+  const out = fmt.replace(/%(-?\d*\.?\d*)?([diouxXeEfgGscp%])/g, (_, flags, spec) => {
+    if (spec === '%') return '%';
+    const v = args[ai++];
+    if (v === undefined) return '(null)';
+    switch (spec) {
+      case 'd': case 'i': return Number(v).toString();
+      case 'u': return (BigInt.asUintN(64, v)).toString();
+      case 'o': return Number(v).toString(8);
+      case 'x': return Number(v).toString(16);
+      case 'X': return Number(v).toString(16).toUpperCase();
+      case 'f': case 'e': case 'E': case 'g': case 'G': {
+        const t = new DataView(new ArrayBuffer(8));
+        t.setBigInt64(0, v, true);
+        const f = t.getFloat64(0, true);
+        return spec === 'f' ? f.toFixed(6)
+             : spec === 'e' ? f.toExponential(6)
+             : f.toPrecision(6);
+      }
+      case 's': return readCStr(v);
+      case 'c': return String.fromCharCode(Number(v));
+      case 'p': return '0x' + Number(v).toString(16);
+      default:  return '%' + spec;
+    }
+  });
+
+  logOut(out);
+  return BigInt(out.length);
+}
+
+// ── Import object ─────────────────────────────────────────────────
+// Uses a Proxy so any env.NAME_variadic or unknown import gets a stub.
+function makeImports() {
+  const known = {
+    malloc: (size) => {
+      const p = mallocPtr;
+      mallocPtr = (mallocPtr + Number(size) + 7) & ~7;
+      return p;
+    },
+    free:             () => {},
+    printf_variadic:  impl_printf,
+    fprintf_variadic: impl_printf,
+    sprintf_variadic: () => 0n,
+    scanf_variadic:   () => 0n,
+    puts: (ptr) => { logOut(readCStr(ptr) + '\n'); return 0n; },
+    putchar: (c)  => { logOut(String.fromCharCode(Number(c))); return c; },
+    exit: (code)  => { log(`exit(${code})`, 'log-info'); throw new Error('exit'); },
+    abort: ()     => { log('abort()', 'log-err'); throw new Error('abort'); },
+  };
+  return {
+    env: new Proxy(known, {
+      get(target, name) {
+        if (name in target) return target[name];
+        if (String(name).endsWith('_variadic'))
+          return (fp, vp, vc) => {
+            log(`[stub variadic] ${name}(fmt="${readCStr(fp)}")`, 'log-info');
+            return 0n;
+          };
+        return (...args) => { log(`[stub] ${name}()`, 'log-info'); return 0n; };
+      }
+    })
+  };
+}
+
+// ── Load wasm ────────────────────────────────────────────────────
+async function loadBytes(bytes) {
   clearCon();
-  log(`Loading ${file.name} (${(file.size/1024).toFixed(1)} KB)…`);
-  const buf = await file.arrayBuffer();
-  const bytes = new Uint8Array(buf);
-
-  if (file.name.endsWith('.wat') || (bytes[0] === 0x28)) {
-    // Looks like text WAT — we can't assemble in-browser without wat2wasm.
-    // Instruct the user to convert first.
-    log('WAT detected. Convert to .wasm first:', 'log-err');
-    log('  wat2wasm your_file.wat -o your_file.wasm', 'log-val');
-    log('Then reload the .wasm file here.');
-    return;
+  wasmMemory = null;
+  mallocPtr  = 3 * 1024 * 1024;
+  try {
+    const result = await WebAssembly.instantiate(bytes, makeImports());
+    wasmInstance = result.instance;
+    wasmMemory   = wasmInstance.exports.memory || null;
+    log('Module loaded ✓', 'log-ok');
+    renderExports(wasmInstance.exports);
+    if (typeof wasmInstance.exports.main === 'function') {
+      log('Running main()…');
+      try { wasmInstance.exports.main(0n, 0n); }
+      catch(e) { if (e.message !== 'exit') log('runtime error: ' + e.message, 'log-err'); }
+    }
+  } catch(e) {
+    log('Load error: ' + e.message, 'log-err');
   }
-
-  // Validate wasm magic
-  if (bytes[0] !== 0x00 || bytes[1] !== 0x61 ||
-      bytes[2] !== 0x73 || bytes[3] !== 0x6d) {
-    log('Not a valid .wasm file (bad magic bytes)', 'log-err');
-    return;
-  }
-
-  await loadBytes(bytes);
 }
 
 // ── Render export buttons ────────────────────────────────────────
@@ -229,82 +210,77 @@ function renderExports(exports) {
   const wrap = document.getElementById('exports-wrap');
   const div  = document.getElementById('exports');
   div.innerHTML = '';
-
-  const fns = Object.entries(exports).filter(([,v]) => typeof v === 'function');
-  if (fns.length === 0) {
-    log('No exported functions found.', 'log-err');
-    wrap.style.display = 'none';
-    return;
-  }
-
+  const fns = Object.entries(exports)
+    .filter(([k,v]) => typeof v === 'function' && k !== 'memory');
+  if (!fns.length) { wrap.style.display='none'; return; }
   wrap.style.display = '';
 
   for (const [name, fn] of fns) {
-    if (name === 'memory') continue;
-    const arity = fn.length;  // wasm function arity
+    const arity = fn.length;
     const row = document.createElement('div');
     row.className = 'fn-row';
 
     const nameEl = document.createElement('span');
     nameEl.className = 'fn-name';
-    nameEl.textContent = name + '(…)';
+    nameEl.textContent = name + '(' + Array.from({length:arity},(_,i)=>'arg'+i).join(', ') + ')';
     row.appendChild(nameEl);
 
-    // one input per parameter
     const inputs = [];
     for (let i = 0; i < arity; i++) {
       const inp = document.createElement('input');
-      inp.type = 'number';
-      inp.value = '0';
-      inp.placeholder = `arg${i}`;
-      row.appendChild(inp);
-      inputs.push(inp);
+      inp.type='number'; inp.value='0'; inp.placeholder='arg'+i;
+      row.appendChild(inp); inputs.push(inp);
     }
 
     const btn = document.createElement('button');
-    btn.textContent = 'Call';
-    row.appendChild(btn);
+    btn.textContent = 'Call'; row.appendChild(btn);
 
     const result = document.createElement('span');
-    result.className = 'fn-result';
-    row.appendChild(result);
+    result.className = 'fn-result'; row.appendChild(result);
 
     btn.addEventListener('click', () => {
       try {
-        // bake wasm uses i64 for all integer params — pass as BigInt
-        const args = inputs.map(inp => BigInt(inp.value || '0'));
-        const ret = fn(...args);
-        const display = (typeof ret === 'bigint') ? ret.toString()
-                      : (ret === undefined) ? 'void'
-                      : String(ret);
-        result.textContent = '→ ' + display;
-        log(`${name}(${args.join(', ')}) = ${display}`, 'log-val');
+        const args = inputs.map(inp => BigInt(inp.value||'0'));
+        const ret  = fn(...args);
+        const disp = ret===undefined ? 'void'
+                   : typeof ret==='bigint' ? ret.toString() : String(ret);
+        result.textContent = '→ ' + disp;
+        log(`${name}(${args.join(', ')}) = ${disp}`, 'log-val');
       } catch(e) {
-        result.textContent = 'error';
+        result.textContent = 'err';
         log(`${name}: ${e.message}`, 'log-err');
       }
     });
-
     div.appendChild(row);
   }
-
-  log(`Found ${fns.length} export(s): ${fns.map(([n])=>n).join(', ')}`);
+  log(`Exports: ${fns.map(([n])=>n).join(', ')}`);
 }
 
-// ── Drag-and-drop + file input ───────────────────────────────────
+// ── File drop / input ────────────────────────────────────────────
+async function handleFile(file) {
+  clearCon();
+  log(`Loading ${file.name} (${(file.size/1024).toFixed(1)} KB)…`);
+  const buf   = await file.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  if (file.name.endsWith('.wat') || bytes[0]===0x28) {
+    log('.wat detected — convert first:', 'log-err');
+    log('  wat2wasm prog.wat -o prog.wasm', 'log-val'); return;
+  }
+  if (bytes[0]!==0x00||bytes[1]!==0x61||bytes[2]!==0x73||bytes[3]!==0x6d) {
+    log('Not a valid .wasm file', 'log-err'); return;
+  }
+  await loadBytes(bytes);
+}
+
 const drop  = document.getElementById('drop');
 const input = document.getElementById('file-input');
-
-drop.addEventListener('click', () => input.click());
-input.addEventListener('change', () => { if (input.files[0]) handleFile(input.files[0]); });
-
-drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
-drop.addEventListener('dragleave', () => drop.classList.remove('over'));
-drop.addEventListener('drop', e => {
-  e.preventDefault();
-  drop.classList.remove('over');
-  const file = e.dataTransfer.files[0];
-  if (file) handleFile(file);
+drop.addEventListener('click', ()=>input.click());
+input.addEventListener('change', ()=>{ if(input.files[0]) handleFile(input.files[0]); });
+drop.addEventListener('dragover', e=>{ e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', ()=>drop.classList.remove('over'));
+drop.addEventListener('drop', e=>{
+  e.preventDefault(); drop.classList.remove('over');
+  if(e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
 });
 </script>
 </body>
